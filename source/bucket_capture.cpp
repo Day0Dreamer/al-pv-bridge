@@ -1,34 +1,33 @@
 /*
-	Bucket Capture — VideoPostData implementation
+	Bucket Capture -- VideoPostData implementation
 	(C) Amber Light, 2026
 
-	Findings from v1:
-	  - VIDEOPOSTCALL::TILE never fires (Standard/Physical renderer)
-	  - ExecuteLine() fires per-scanline with bucket coordinates (line, xmin, xmax)
-	  - pp->cpu_num identifies which render thread owns the bucket
-	  - Bucket boundaries detected by tracking per-CPU (x-range, line sequence)
+	Strategy (v6 -- .albt binary stream):
+	  1. At FRAMESEQUENCE OPEN, read scene UUID and open .albt file
+	  2. At RENDER OPEN, compute bucket grid and write stream header (once)
+	  3. In ExecuteLine(), map scanline to grid cell; when complete, write progressive record
+	  4. At INNER close, re-save ALL cells as final records + frame sentinel
+	  5. At FRAMESEQUENCE CLOSE, close .albt file
 
-	Strategy (v5 — grid-based):
-	  1. At RENDER OPEN, compute the bucket grid from frame dimensions + bucket size
-	  2. In ExecuteLine(), map each scanline to its grid cell and count lines received
-	  3. When a cell reaches its expected line count → save tile immediately
-	  4. At INNER close, save any unsaved cells as a safety net
-
-	Previous heuristic approach (v2-v4) tried to detect bucket boundaries from
-	per-CPU line sequences. This produced off-grid tiles when gap tolerance and
-	height caps interacted with thread scheduling. The grid approach is exact:
-	each scanline self-identifies its cell via cellX = xmin/bucketW, cellY = line/bucketH.
-
-	Output goes to C:\temp\bucket_capture_cpp\ as individual bucket PNGs.
+	Output: C:\temp\albt_streams\{uuid}.albt
+	Format: docs/adr/009-binary-tile-stream-for-render-farm.md
 */
 
 #include "bucket_capture.h"
 #include "c4d_videopostdata.h"
 
+#include <cstdio>     // FILE*, fwrite, fopen, fclose, fflush
+#include <mutex>      // std::mutex, std::lock_guard
+
 using namespace cinema;
 
+// .albt phase constants
+static const UChar PHASE_PROGRESSIVE = 0x00;
+static const UChar PHASE_FINAL       = 0x01;
+static const UChar PHASE_SENTINEL    = 0xFF;
+
 // ---------------------------------------------------------------------------
-// Grid cell — tracks how many scanlines have been received for one bucket
+// Grid cell -- tracks how many scanlines have been received for one bucket
 // ---------------------------------------------------------------------------
 struct GridCell
 {
@@ -37,7 +36,7 @@ struct GridCell
 };
 
 // ---------------------------------------------------------------------------
-// BucketCapturePost — VideoPostData that intercepts render buckets
+// BucketCapturePost -- VideoPostData that writes .albt binary stream
 // ---------------------------------------------------------------------------
 class BucketCapturePost : public VideoPostData
 {
@@ -45,7 +44,6 @@ class BucketCapturePost : public VideoPostData
 
 private:
 	// Per-sequence state
-	Filename _outputDir;
 	Int32    _frameIndex;
 
 	// Per-frame counters
@@ -62,160 +60,23 @@ private:
 	Int32 _bucketSizeX;
 	Int32 _bucketSizeY;
 
-	// Bucket grid — each cell tracks scanline count for one bucket position
+	// Bucket grid -- each cell tracks scanline count for one bucket position
 	static const Int32 MAX_GRID_CELLS = 16384;  // up to ~128x128 grid
 	GridCell _grid[MAX_GRID_CELLS];
 	Int32    _gridCols;
 	Int32    _gridRows;
 
-	// Save just the bucket tile region from VPBuffer
-	Bool SaveBucketTile(Render* render, const Filename& path,
-		Int32 tileX1, Int32 tileY1, Int32 tileX2, Int32 tileY2)
-	{
-		VPBuffer* rgba = render->GetBuffer(VPBUFFER_RGBA, NOTOK);
-		if (!rgba)
-			return false;
+	// === .albt stream state ===
+	FILE*       _albtFile;          // opened at FRAMESEQUENCE open, closed at close
+	Int64       _streamStartTime;   // GeGetTimer() ms at file open
+	Bool        _headerWritten;     // deferred to RENDER open (needs frame dims)
+	String      _jobUUID;           // from doc BaseContainer[AMBERLIGHT_SCENE_UUID]
+	Bool        _sentinelWritten;   // prevents duplicate sentinels on multi-pass
+	std::mutex  _writeMutex;        // protects all fwrite() calls
 
-		Int32 cpp = rgba->GetInfo(VPGETINFO::CPP);
-
-		Int32 tileW = tileX2 - tileX1 + 1;
-		Int32 tileH = tileY2 - tileY1 + 1;
-
-		if (tileW <= 0 || tileH <= 0)
-			return false;
-
-		BaseBitmap* bmp = BaseBitmap::Alloc();
-		if (!bmp)
-			return false;
-
-		if (bmp->Init(tileW, tileH) != IMAGERESULT::OK)
-		{
-			BaseBitmap::Free(bmp);
-			return false;
-		}
-
-		Int bufSize = cpp * tileW;
-		Float32* buffer = nullptr;
-		iferr (buffer = NewMemClear(Float32, bufSize))
-		{
-			BaseBitmap::Free(bmp);
-			return false;
-		}
-
-		for (Int32 y = tileY1; y <= tileY2; y++)
-		{
-			rgba->GetLine(tileX1, y, tileW, buffer, 32, true);
-
-			Float32* b = buffer;
-			for (Int32 x = 0; x < tileW; x++, b += cpp)
-			{
-				Int32 r = (Int32)(ClampValue(b[0], 0.0f, 1.0f) * 255.0f);
-				Int32 g = (Int32)(ClampValue(b[1], 0.0f, 1.0f) * 255.0f);
-				Int32 bl = (Int32)(ClampValue(b[2], 0.0f, 1.0f) * 255.0f);
-				bmp->SetPixel(x, y - tileY1, r, g, bl);
-			}
-		}
-
-		DeleteMem(buffer);
-
-		Bool ok = (bmp->Save(path, FILTER_PNG, nullptr, SAVEBIT::NONE) == IMAGERESULT::OK);
-		BaseBitmap::Free(bmp);
-		return ok;
-	}
-
-	// Save full frame from VPBuffer
-	Bool SaveFullFrame(Render* render, const Filename& path)
-	{
-		VPBuffer* rgba = render->GetBuffer(VPBUFFER_RGBA, NOTOK);
-		if (!rgba)
-			return false;
-
-		Int32 w = rgba->GetBw();
-		Int32 h = rgba->GetBh();
-		Int32 cpp = rgba->GetInfo(VPGETINFO::CPP);
-
-		BaseBitmap* bmp = BaseBitmap::Alloc();
-		if (!bmp)
-			return false;
-
-		if (bmp->Init(w, h) != IMAGERESULT::OK)
-		{
-			BaseBitmap::Free(bmp);
-			return false;
-		}
-
-		Int bufSize = cpp * w;
-		Float32* buffer = nullptr;
-		iferr (buffer = NewMemClear(Float32, bufSize))
-		{
-			BaseBitmap::Free(bmp);
-			return false;
-		}
-
-		for (Int32 y = 0; y < h; y++)
-		{
-			rgba->GetLine(0, y, w, buffer, 32, true);
-
-			Float32* b = buffer;
-			for (Int32 x = 0; x < w; x++, b += cpp)
-			{
-				Int32 r = (Int32)(ClampValue(b[0], 0.0f, 1.0f) * 255.0f);
-				Int32 g = (Int32)(ClampValue(b[1], 0.0f, 1.0f) * 255.0f);
-				Int32 bl = (Int32)(ClampValue(b[2], 0.0f, 1.0f) * 255.0f);
-				bmp->SetPixel(x, y, r, g, bl);
-			}
-		}
-
-		DeleteMem(buffer);
-
-		Bool ok = (bmp->Save(path, FILTER_PNG, nullptr, SAVEBIT::NONE) == IMAGERESULT::OK);
-		BaseBitmap::Free(bmp);
-		return ok;
-	}
-
-	// Build a tile filename: "f01_x064_y128_64x64.png"
-	Filename MakeTileFilename(Int32 frame, Int32 x, Int32 y, Int32 w, Int32 h)
-	{
-		String frameStr = String::IntToString(frame);
-		while (frameStr.GetLength() < 2)
-		{
-			String padded = "0"_s;
-			padded += frameStr;
-			frameStr = padded;
-		}
-
-		String name = "f"_s;
-		name += frameStr;
-		name += "_x"_s;
-		name += String::IntToString(x);
-		name += "_y"_s;
-		name += String::IntToString(y);
-		name += "_"_s;
-		name += String::IntToString(w);
-		name += "x"_s;
-		name += String::IntToString(h);
-		name += ".png"_s;
-		return _outputDir + Filename(name);
-	}
-
-	// Build a simple filename: "f01_frame.png"
-	Filename MakeFrameFilename(Int32 frame)
-	{
-		String frameStr = String::IntToString(frame);
-		while (frameStr.GetLength() < 2)
-		{
-			String padded = "0"_s;
-			padded += frameStr;
-			frameStr = padded;
-		}
-
-		String name = "f"_s;
-		name += frameStr;
-		name += "_frame.png"_s;
-		return _outputDir + Filename(name);
-	}
-
-	// Compute the pixel rect for a grid cell, handling right/bottom edge
+	// ---------------------------------------------------------------
+	// GetCellRect -- compute pixel rect for a grid cell
+	// ---------------------------------------------------------------
 	void GetCellRect(Int32 cellX, Int32 cellY,
 		Int32& outX, Int32& outY, Int32& outW, Int32& outH)
 	{
@@ -231,48 +92,168 @@ private:
 			outH = _frameH - outY;
 	}
 
-	// Save a grid cell's tile from VPBuffer
-	void SaveGridCell(Render* render, Int32 frame, Int32 cellX, Int32 cellY)
+	// ---------------------------------------------------------------
+	// WriteStreamHeader -- 12 bytes, called once at first RENDER open
+	// ---------------------------------------------------------------
+	void WriteStreamHeader()
 	{
-		if (!render)
+		if (!_albtFile)
 			return;
 
+		const char magic[4] = {'A', 'L', 'B', 'T'};
+		UInt16 version = 1;
+		UInt16 fw = (UInt16)_frameW;
+		UInt16 fh = (UInt16)_frameH;
+		UInt16 bs = (UInt16)_bucketSizeX;
+
+		std::lock_guard<std::mutex> lock(_writeMutex);
+		fwrite(magic, 1, 4, _albtFile);
+		fwrite(&version, 2, 1, _albtFile);
+		fwrite(&fw, 2, 1, _albtFile);
+		fwrite(&fh, 2, 1, _albtFile);
+		fwrite(&bs, 2, 1, _albtFile);
+		fflush(_albtFile);
+	}
+
+	// ---------------------------------------------------------------
+	// WriteTileRecord -- 25-byte header + raw RGB pixels
+	//
+	// Reads VPBuffer (same GetLine approach as old SaveBucketTile),
+	// converts Float32 -> UChar RGB888, writes to .albt under lock.
+	// VPBuffer read happens OUTSIDE lock (expensive part).
+	// ---------------------------------------------------------------
+	Bool WriteTileRecord(Render* render, UInt32 frame, UChar phase,
+		Int32 tileX, Int32 tileY, Int32 tileW, Int32 tileH)
+	{
+		if (!_albtFile || !render)
+			return false;
+
+		VPBuffer* rgba = render->GetBuffer(VPBUFFER_RGBA, NOTOK);
+		if (!rgba)
+			return false;
+
+		Int32 cpp = rgba->GetInfo(VPGETINFO::CPP);
+		if (tileW <= 0 || tileH <= 0)
+			return false;
+
+		// Allocate RGB output buffer
+		Int rgbSize = tileW * tileH * 3;
+		UChar* rgbBuf = nullptr;
+		iferr (rgbBuf = NewMemClear(UChar, rgbSize))
+			return false;
+
+		// Allocate scanline read buffer
+		Int bufSize = cpp * tileW;
+		Float32* lineBuffer = nullptr;
+		iferr (lineBuffer = NewMemClear(Float32, bufSize))
+		{
+			DeleteMem(rgbBuf);
+			return false;
+		}
+
+		// Read VPBuffer -> convert Float32 -> RGB888 (OUTSIDE lock)
+		for (Int32 y = 0; y < tileH; y++)
+		{
+			rgba->GetLine(tileX, tileY + y, tileW, lineBuffer, 32, true);
+			Float32* src = lineBuffer;
+			UChar* dst = rgbBuf + y * tileW * 3;
+
+			for (Int32 x = 0; x < tileW; x++, src += cpp)
+			{
+				dst[0] = (UChar)(ClampValue(src[0], 0.0f, 1.0f) * 255.0f);
+				dst[1] = (UChar)(ClampValue(src[1], 0.0f, 1.0f) * 255.0f);
+				dst[2] = (UChar)(ClampValue(src[2], 0.0f, 1.0f) * 255.0f);
+				dst += 3;
+			}
+		}
+		DeleteMem(lineBuffer);
+
+		// Compute timestamp (microseconds since stream start)
+		Int64 nowMs = GeGetTimer();
+		UInt64 timestampUs = (UInt64)((nowMs - _streamStartTime) * 1000);
+		UInt32 pixLen = (UInt32)rgbSize;
+
+		// Pack tile header fields
+		UInt16 x16 = (UInt16)tileX;
+		UInt16 y16 = (UInt16)tileY;
+		UInt16 w16 = (UInt16)tileW;
+		UInt16 h16 = (UInt16)tileH;
+
+		// Write header + pixels UNDER LOCK
+		{
+			std::lock_guard<std::mutex> lock(_writeMutex);
+			fwrite(&frame, 4, 1, _albtFile);
+			fwrite(&phase, 1, 1, _albtFile);
+			fwrite(&x16, 2, 1, _albtFile);
+			fwrite(&y16, 2, 1, _albtFile);
+			fwrite(&w16, 2, 1, _albtFile);
+			fwrite(&h16, 2, 1, _albtFile);
+			fwrite(&timestampUs, 8, 1, _albtFile);
+			fwrite(&pixLen, 4, 1, _albtFile);
+			fwrite(rgbBuf, 1, rgbSize, _albtFile);
+			fflush(_albtFile);
+		}
+
+		DeleteMem(rgbBuf);
+		return true;
+	}
+
+	// ---------------------------------------------------------------
+	// WriteFrameSentinel -- 5 bytes
+	// ---------------------------------------------------------------
+	void WriteFrameSentinel(UInt32 frame)
+	{
+		if (!_albtFile)
+			return;
+
+		std::lock_guard<std::mutex> lock(_writeMutex);
+		fwrite(&frame, 4, 1, _albtFile);
+		UChar sentinel = PHASE_SENTINEL;
+		fwrite(&sentinel, 1, 1, _albtFile);
+		fflush(_albtFile);
+	}
+
+	// ---------------------------------------------------------------
+	// SaveGridCell -- writes one tile record for a grid cell
+	// ---------------------------------------------------------------
+	void SaveGridCell(Render* render, UInt32 frame, UChar phase,
+		Int32 cellX, Int32 cellY)
+	{
 		Int32 x, y, w, h;
 		GetCellRect(cellX, cellY, x, y, w, h);
-
 		if (w <= 0 || h <= 0)
 			return;
 
-		Filename fn = MakeTileFilename(frame, x, y, w, h);
-		SaveBucketTile(render, fn, x, y, x + w - 1, y + h - 1);
+		WriteTileRecord(render, frame, phase, x, y, w, h);
 	}
 
-	// Re-save ALL grid cells with final VPBuffer data (guaranteed correct at INNER close).
-	// Progressive saves from ExecuteLine may have stale pixel data — this overwrites them.
-	void FlushAllCells(Render* render, Int32 frame)
+	// ---------------------------------------------------------------
+	// FlushAllCells -- re-save ALL cells as final + frame sentinel
+	// ---------------------------------------------------------------
+	void FlushAllCells(Render* render, UInt32 frame)
 	{
-		if (!render)
+		if (!render || !_albtFile)
 			return;
 
-		Int32 totalCells = _gridCols * _gridRows;
-		Int32 progressiveCount = 0;
+		if (_sentinelWritten)
+			return;  // multi-pass: already flushed this frame
 
+		Int32 totalCells = _gridCols * _gridRows;
 		for (Int32 i = 0; i < totalCells; i++)
 		{
-			if (_grid[i].saved)
-				progressiveCount++;
-
 			Int32 cellX = i % _gridCols;
 			Int32 cellY = i / _gridCols;
-			SaveGridCell(render, frame, cellX, cellY);
+			SaveGridCell(render, frame, PHASE_FINAL, cellX, cellY);
 			_grid[i].saved = true;
 		}
 
-		String msg = "[BucketCapture] INNER CLOSE -- re-saved all "_s;
+		WriteFrameSentinel(frame);
+		_sentinelWritten = true;
+
+		String msg = "[BucketCapture] Flushed "_s;
 		msg += String::IntToString(totalCells);
-		msg += " tiles ("_s;
-		msg += String::IntToString(progressiveCount);
-		msg += " were progressive previews)"_s;
+		msg += " final tiles + sentinel for frame "_s;
+		msg += String::IntToString((Int32)frame);
 		GePrint(msg);
 	}
 
@@ -285,7 +266,7 @@ public:
 		return VIDEOPOSTINFO::EXECUTELINE;
 	}
 
-	// Accept all render engines for exploration
+	// Accept all render engines except hardware preview
 	virtual Bool RenderEngineCheck(const BaseVideoPost* node, Int32 id) const override
 	{
 		if (id == RDATA_RENDERENGINE_PREVIEWHARDWARE)
@@ -306,14 +287,58 @@ public:
 				{
 					GePrint("[BucketCapture] === FRAMESEQUENCE OPEN ==="_s);
 
-					_outputDir = Filename("C:\\temp\\bucket_capture_cpp"_s);
-					GeFCreateDir(_outputDir);
+					// Read scene UUID from document
+					_jobUUID = ""_s;
+					BaseDocument* doc = node->GetDocument();
+					if (doc)
+					{
+						const BaseContainer* bc = doc->GetDataInstance();
+						if (bc)
+							_jobUUID = bc->GetString(AMBERLIGHT_SCENE_UUID, ""_s);
+					}
 
+					if (_jobUUID.IsEmpty())
+					{
+						_jobUUID = "no-uuid"_s;
+						GePrint("[BucketCapture] WARNING: No scene UUID found"_s);
+					}
+
+					// Create output directory
+					Filename streamDir("C:\\temp\\albt_streams"_s);
+					GeFCreateDir(streamDir);
+
+					// Build path: C:\temp\albt_streams\{uuid}.albt
+					String pathStr = "C:\\temp\\albt_streams\\"_s;
+					pathStr += _jobUUID;
+					pathStr += ".albt"_s;
+
+					Char pathBuf[512];
+					pathStr.GetCString(pathBuf, sizeof(pathBuf), STRINGENCODING::UTF8);
+					_albtFile = fopen(pathBuf, "wb");
+
+					if (!_albtFile)
+					{
+						GePrint("[BucketCapture] ERROR: Failed to open .albt file"_s);
+					}
+					else
+					{
+						String openMsg = "[BucketCapture] Opened "_s;
+						openMsg += pathStr;
+						GePrint(openMsg);
+					}
+
+					_streamStartTime = GeGetTimer();
+					_headerWritten = false;
 					_frameIndex = 0;
 				}
 				else
 				{
 					GePrint("[BucketCapture] === FRAMESEQUENCE CLOSE ==="_s);
+					if (_albtFile)
+					{
+						fclose(_albtFile);
+						_albtFile = nullptr;
+					}
 				}
 				break;
 			}
@@ -325,6 +350,7 @@ public:
 					_frameIndex++;
 					_lineCount = 0;
 					_activeRender = nullptr;
+					_sentinelWritten = false;
 					_bucketSizeX = 64;
 					_bucketSizeY = 64;
 					_frameW = 0;
@@ -339,16 +365,6 @@ public:
 				}
 				else
 				{
-					// Save the final full frame
-					if (vps->render)
-					{
-						Filename fn = MakeFrameFilename(_frameIndex);
-						if (SaveFullFrame(vps->render, fn))
-						{
-							GePrint("[BucketCapture] Saved final frame"_s);
-						}
-					}
-
 					String msg = "[BucketCapture] --- FRAME CLOSE --- lines="_s;
 					msg += String::IntToString(_lineCount);
 					GePrint(msg);
@@ -374,11 +390,11 @@ public:
 							const BaseContainer* bc = rd->GetDataInstance();
 							if (bc)
 							{
-								Bool autoSize = bc->GetBool(7002, true);  // RDATA_AUTOMATICBUCKETSIZE
+								Bool autoSize = bc->GetBool(7002, true);
 								if (!autoSize)
 								{
-									_bucketSizeX = bc->GetInt32(7000, 64);  // RDATA_BUCKETSIZEX
-									_bucketSizeY = bc->GetInt32(7001, 64);  // RDATA_BUCKETSIZEY
+									_bucketSizeX = bc->GetInt32(7000, 64);
+									_bucketSizeY = bc->GetInt32(7001, 64);
 								}
 							}
 						}
@@ -392,7 +408,6 @@ public:
 							_frameW = ray->right - ray->left + 1;
 							_frameH = ray->bottom - ray->top + 1;
 
-							// Compute grid dimensions
 							_gridCols = (_frameW + _bucketSizeX - 1) / _bucketSizeX;
 							_gridRows = (_frameH + _bucketSizeY - 1) / _bucketSizeY;
 
@@ -400,28 +415,27 @@ public:
 							if (totalCells > MAX_GRID_CELLS)
 								totalCells = MAX_GRID_CELLS;
 
-							// Reset grid
 							for (Int32 i = 0; i < totalCells; i++)
 							{
 								_grid[i].linesReceived = 0;
 								_grid[i].saved = false;
 							}
 
+							// Write stream header on first RENDER open
+							if (!_headerWritten && _albtFile)
+							{
+								WriteStreamHeader();
+								_headerWritten = true;
+							}
+
 							String msg = "[BucketCapture] RENDER OPEN "_s;
 							msg += String::IntToString(_frameW);
 							msg += "x"_s;
 							msg += String::IntToString(_frameH);
-							msg += " bucket="_s;
-							msg += String::IntToString(_bucketSizeX);
-							msg += "x"_s;
-							msg += String::IntToString(_bucketSizeY);
 							msg += " grid="_s;
 							msg += String::IntToString(_gridCols);
 							msg += "x"_s;
 							msg += String::IntToString(_gridRows);
-							msg += " ("_s;
-							msg += String::IntToString(_gridCols * _gridRows);
-							msg += " cells)"_s;
 							GePrint(msg);
 						}
 					}
@@ -437,8 +451,9 @@ public:
 			{
 				if (!vps->open)
 				{
-					// Re-save ALL cells with final pixel data (overwrites progressive previews)
-					FlushAllCells(vps->render ? vps->render : _activeRender, _frameIndex);
+					FlushAllCells(
+						vps->render ? vps->render : _activeRender,
+						(UInt32)_frameIndex);
 				}
 				break;
 			}
@@ -451,9 +466,10 @@ public:
 	}
 
 	// -----------------------------------------------------------------
-	// ExecuteLine — per-scanline pixel interception
+	// ExecuteLine -- per-scanline pixel interception
 	// Maps each scanline to its grid cell and increments the line counter.
-	// When a cell has received all its expected lines → save immediately.
+	// When a cell has received all its expected lines -> write progressive tile.
+	// Grid logic unchanged from V5. Only the save call changes (PNG -> .albt).
 	// -----------------------------------------------------------------
 	virtual void ExecuteLine(BaseVideoPost* node, PixelPost* pp) override
 	{
@@ -479,7 +495,6 @@ public:
 		// Check if this cell is now complete
 		if (!cell.saved)
 		{
-			// Expected height for this cell (edge cells may be shorter)
 			Int32 expectedH = _bucketSizeY;
 			Int32 cellBottom = (cellY + 1) * _bucketSizeY;
 			if (cellBottom > _frameH)
@@ -488,16 +503,15 @@ public:
 			if (cell.linesReceived >= expectedH && _activeRender)
 			{
 				cell.saved = true;
-				SaveGridCell(_activeRender, _frameIndex, cellX, cellY);
+				SaveGridCell(_activeRender, (UInt32)_frameIndex,
+					PHASE_PROGRESSIVE, cellX, cellY);
 			}
 		}
 
 		// Log first 5 lines for debugging
 		if (_lineCount <= 5)
 		{
-			String msg = "[BucketCapture] ExecuteLine: cpu="_s;
-			msg += String::IntToString(pp->cpu_num);
-			msg += " line="_s;
+			String msg = "[BucketCapture] ExecuteLine: line="_s;
 			msg += String::IntToString(pp->line);
 			msg += " x="_s;
 			msg += String::IntToString(pp->xmin);
@@ -523,8 +537,8 @@ Bool RegisterBucketCapture()
 		"Bucket Capture"_s,
 		0,
 		BucketCapturePost::Alloc,
-		String(),      // no description resource
-		0,             // disklevel
-		0              // priority
+		String(),
+		0,
+		0
 	);
 }
