@@ -1,17 +1,22 @@
 /*
-	Bucket Capture -- VideoPostData for intercepting render buckets
+	Bucket Capture -- VideoPostData for intercepting render buckets (v7)
 	(C) Amber Light, 2026
 
 	VideoPostData plugin that intercepts individual render buckets from
-	Cinema 4D's Standard/Physical renderer pipeline and writes them as
-	an .albt binary stream (ADR-009).
+	Cinema 4D's render pipeline and writes them as an .albt binary stream
+	(ADR-009).  Works with ALL renderers:
+
+	  - Standard/Physical: ExecuteLine() per-scanline callbacks (multi-threaded)
+	  - GPU renderers (Redshift, Octane, Arnold): VPBuffer polling thread
+	    samples center-pixel per cell every 250ms to detect rendered regions
 
 	Key findings:
 	  - VIDEOPOSTCALL::TILE never fires (dead enum for Standard/Physical)
-	  - ExecuteLine() IS the real bucket hook -- per-scanline, multi-threaded
+	  - ExecuteLine() IS the real bucket hook -- but only for CPU renderers
+	  - GPU renderers skip ExecuteLine entirely; VPBuffer poll fills the gap
 	  - Bucket boundaries detected via grid mapping (cellX = xmin/bucketW)
 	  - VPBuffer safely readable at INNER close (single-threaded)
-	  - Two-phase save: progressive from ExecuteLine, final at INNER close
+	  - Three-phase save: progressive from ExecuteLine OR poll, final at INNER
 
 	Output: C:\temp\albt_streams\{uuid}.albt
 	Format: docs/adr/009-binary-tile-stream-for-render-farm.md

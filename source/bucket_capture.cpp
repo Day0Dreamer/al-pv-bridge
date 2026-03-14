@@ -2,12 +2,18 @@
 	Bucket Capture -- VideoPostData implementation
 	(C) Amber Light, 2026
 
-	Strategy (v6 -- .albt binary stream):
+	Strategy (v7 -- .albt binary stream + VPBuffer polling):
 	  1. At FRAMESEQUENCE OPEN, read scene UUID and open .albt file
-	  2. At RENDER OPEN, compute bucket grid and write stream header (once)
+	  2. At RENDER OPEN, compute bucket grid, write stream header, start poll thread
 	  3. In ExecuteLine(), map scanline to grid cell; when complete, write progressive record
-	  4. At INNER close, re-save ALL cells as final records + frame sentinel
-	  5. At FRAMESEQUENCE CLOSE, close .albt file
+	     (Standard/Physical only -- GPU renderers skip ExecuteLine entirely)
+	  4. Poll thread samples VPBuffer center-pixel per cell every 250ms,
+	     writes progressive tiles for changed cells (GPU renderers)
+	  5. At INNER close, stop poll thread, re-save ALL cells as final + sentinel
+	  6. At FRAMESEQUENCE CLOSE, close .albt file
+
+	The poll thread is harmless for Standard/Physical: ExecuteLine marks cells
+	saved first, so the poll thread finds them saved and writes nothing.
 
 	Output: $ALBT_STREAM_DIR\{uuid}.albt  (default: C:\temp\albt_streams)
 	Format: docs/adr/009-binary-tile-stream-for-render-farm.md
@@ -19,6 +25,9 @@
 #include <cstdio>     // FILE*, fwrite, fopen, fclose, fflush
 #include <cstdlib>    // getenv
 #include <mutex>      // std::mutex, std::lock_guard
+#include <thread>     // std::thread
+#include <atomic>     // std::atomic<bool>
+#include <chrono>     // std::chrono::milliseconds
 
 using namespace cinema;
 
@@ -75,6 +84,16 @@ private:
 	Bool        _sentinelWritten;   // prevents duplicate sentinels on multi-pass
 	std::mutex  _writeMutex;        // protects all fwrite() calls
 
+	// === VPBuffer polling thread (for GPU renderers) ===
+	std::thread        _pollThread;
+	std::atomic<bool>  _pollRunning{false};
+	Float32*           _baseline;    // 1 RGBA sample per cell (heap, ~32KB for 4K)
+	Bool               _debugPoll;       // set ALBT_DEBUG_POLL=1 to enable poll logging
+	Int32              _pollIterations;   // diagnostic counter
+	Int32              _pollDetections;   // cells detected as changed
+	Int32              _pollWriteOK;     // successful WriteTileRecord calls from poll
+	Int32              _pollWriteFail;   // failed WriteTileRecord calls from poll
+
 	// ---------------------------------------------------------------
 	// GetCellRect -- compute pixel rect for a grid cell
 	// ---------------------------------------------------------------
@@ -91,6 +110,297 @@ private:
 			outW = _frameW - outX;
 		if (outY + outH > _frameH)
 			outH = _frameH - outY;
+	}
+
+	// ---------------------------------------------------------------
+	// PollVPBuffer -- sample center pixel of each unsaved cell,
+	// compare vs baseline, write progressive tile if changed.
+	// Called from poll thread only.
+	// ---------------------------------------------------------------
+	void PollVPBuffer()
+	{
+		_pollIterations++;
+
+		if (!_activeRender)
+		{
+			if (_debugPoll && _pollIterations <= 3)
+				GePrint("[Poll] BAIL: _activeRender is null"_s);
+			return;
+		}
+		if (!_albtFile)
+		{
+			if (_debugPoll && _pollIterations <= 3)
+				GePrint("[Poll] BAIL: _albtFile is null"_s);
+			return;
+		}
+		if (!_baseline)
+		{
+			if (_debugPoll && _pollIterations <= 3)
+				GePrint("[Poll] BAIL: _baseline is null"_s);
+			return;
+		}
+
+		VPBuffer* rgba = _activeRender->GetBuffer(VPBUFFER_RGBA, NOTOK);
+		if (!rgba)
+		{
+			if (_debugPoll && _pollIterations <= 3)
+				GePrint("[Poll] BAIL: VPBuffer RGBA is null"_s);
+			return;
+		}
+
+		Int32 cpp = rgba->GetInfo(VPGETINFO::CPP);
+		if (cpp < 3)
+		{
+			if (_debugPoll && _pollIterations <= 3)
+			{
+				String msg = "[Poll] BAIL: cpp="_s;
+				msg += String::IntToString(cpp);
+				GePrint(msg);
+			}
+			return;
+		}
+
+		Int32 totalCells = _gridCols * _gridRows;
+		Float32 sample[4] = {0, 0, 0, 0};
+		Int32 detectedThisRound = 0;
+		Int32 skippedSaved = 0;
+
+		for (Int32 i = 0; i < totalCells; i++)
+		{
+			if (_grid[i].saved)
+			{
+				skippedSaved++;
+				continue;
+			}
+
+			Int32 cellX = i % _gridCols;
+			Int32 cellY = i / _gridCols;
+
+			Int32 px, py, pw, ph;
+			GetCellRect(cellX, cellY, px, py, pw, ph);
+			if (pw <= 0 || ph <= 0)
+				continue;
+
+			// Sample center pixel
+			Int32 cx = px + pw / 2;
+			Int32 cy = py + ph / 2;
+
+			rgba->GetLine(cx, cy, 1, sample, 32, true);
+
+			// Compare RGB against baseline (exact compare, raw buffer values)
+			Int32 bIdx = i * 4;
+			if (sample[0] != _baseline[bIdx]   ||
+				sample[1] != _baseline[bIdx+1] ||
+				sample[2] != _baseline[bIdx+2])
+			{
+				detectedThisRound++;
+
+				if (_debugPoll && detectedThisRound == 1 && _pollIterations <= 8)
+				{
+					String msg = "[Poll] iter="_s;
+					msg += String::IntToString(_pollIterations);
+					msg += " cell("_s;
+					msg += String::IntToString(cellX);
+					msg += ","_s;
+					msg += String::IntToString(cellY);
+					msg += ") baseline=("_s;
+					msg += String::FloatToString(_baseline[bIdx], -1, 4);
+					msg += ","_s;
+					msg += String::FloatToString(_baseline[bIdx+1], -1, 4);
+					msg += ","_s;
+					msg += String::FloatToString(_baseline[bIdx+2], -1, 4);
+					msg += ") sample=("_s;
+					msg += String::FloatToString(sample[0], -1, 4);
+					msg += ","_s;
+					msg += String::FloatToString(sample[1], -1, 4);
+					msg += ","_s;
+					msg += String::FloatToString(sample[2], -1, 4);
+					msg += ")"_s;
+					GePrint(msg);
+				}
+
+				// Update baseline to prevent re-triggering
+				_baseline[bIdx]   = sample[0];
+				_baseline[bIdx+1] = sample[1];
+				_baseline[bIdx+2] = sample[2];
+
+				// Write progressive tile record
+				_grid[i].saved = true;
+
+				if (_debugPoll)
+				{
+					long posBefore = _albtFile ? ftell(_albtFile) : -1;
+					SaveGridCell(_activeRender, (UInt32)_frameIndex,
+						PHASE_PROGRESSIVE, cellX, cellY);
+					long posAfter = _albtFile ? ftell(_albtFile) : -1;
+					if (posAfter > posBefore)
+						_pollWriteOK++;
+					else
+						_pollWriteFail++;
+				}
+				else
+				{
+					SaveGridCell(_activeRender, (UInt32)_frameIndex,
+						PHASE_PROGRESSIVE, cellX, cellY);
+				}
+
+				_grid[i].saved = false;  // allow re-detection on next poll
+				_pollDetections++;
+			}
+		}
+
+		if (_debugPoll && (_pollIterations % 4 == 0 || detectedThisRound > 0))
+		{
+			long filePos = _albtFile ? ftell(_albtFile) : -1;
+			String msg = "[Poll] iter="_s;
+			msg += String::IntToString(_pollIterations);
+			msg += " checked="_s;
+			msg += String::IntToString(totalCells - skippedSaved);
+			msg += " saved="_s;
+			msg += String::IntToString(skippedSaved);
+			msg += " detected="_s;
+			msg += String::IntToString(detectedThisRound);
+			msg += " fpos="_s;
+			msg += String::IntToString((Int32)filePos);
+			msg += " writeOK="_s;
+			msg += String::IntToString(_pollWriteOK);
+			msg += " writeFail="_s;
+			msg += String::IntToString(_pollWriteFail);
+			GePrint(msg);
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// PollLoop -- thread entry point: poll VPBuffer every 250ms
+	// ---------------------------------------------------------------
+	void PollLoop()
+	{
+		while (_pollRunning.load())
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (_pollRunning.load())
+				PollVPBuffer();
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// StartPollThread -- alloc baseline, capture initial samples,
+	// launch polling thread.  Called at RENDER OPEN.
+	// ---------------------------------------------------------------
+	void StartPollThread()
+	{
+		if (_pollRunning.load())
+			return;
+
+		if (!_activeRender || !_albtFile || _gridCols <= 0 || _gridRows <= 0)
+		{
+			if (_debugPoll)
+			{
+				String msg = "[Poll] StartPollThread BAIL: render="_s;
+				msg += _activeRender ? "ok"_s : "NULL"_s;
+				msg += " file="_s;
+				msg += _albtFile ? "ok"_s : "NULL"_s;
+				msg += " grid="_s;
+				msg += String::IntToString(_gridCols);
+				msg += "x"_s;
+				msg += String::IntToString(_gridRows);
+				GePrint(msg);
+			}
+			return;
+		}
+
+		Int32 totalCells = _gridCols * _gridRows;
+		_pollIterations = 0;
+		_pollDetections = 0;
+		_pollWriteOK = 0;
+		_pollWriteFail = 0;
+
+		// Allocate baseline: 4 floats (RGBA) per cell
+		iferr (_baseline = NewMemClear(Float32, totalCells * 4))
+		{
+			_baseline = nullptr;
+			return;
+		}
+
+		// Capture initial baseline samples from VPBuffer
+		VPBuffer* rgba = _activeRender->GetBuffer(VPBUFFER_RGBA, NOTOK);
+		if (rgba)
+		{
+			Float32 sample[4];
+			for (Int32 i = 0; i < totalCells; i++)
+			{
+				Int32 cellX = i % _gridCols;
+				Int32 cellY = i / _gridCols;
+
+				Int32 px, py, pw, ph;
+				GetCellRect(cellX, cellY, px, py, pw, ph);
+				if (pw <= 0 || ph <= 0)
+					continue;
+
+				Int32 cx = px + pw / 2;
+				Int32 cy = py + ph / 2;
+
+				rgba->GetLine(cx, cy, 1, sample, 32, true);
+				Int32 bIdx = i * 4;
+				_baseline[bIdx]   = sample[0];
+				_baseline[bIdx+1] = sample[1];
+				_baseline[bIdx+2] = sample[2];
+				_baseline[bIdx+3] = sample[3];
+			}
+
+			if (_debugPoll)
+			{
+				String msg = "[Poll] Baseline captured: cells="_s;
+				msg += String::IntToString(totalCells);
+				msg += " cpp="_s;
+				msg += String::IntToString(rgba->GetInfo(VPGETINFO::CPP));
+				GePrint(msg);
+			}
+		}
+		else if (_debugPoll)
+		{
+			GePrint("[Poll] WARNING: VPBuffer null at baseline capture!"_s);
+		}
+
+		_pollRunning.store(true);
+		_pollThread = std::thread([this]() { PollLoop(); });
+
+		if (_debugPoll)
+			GePrint("[Poll] Thread launched"_s);
+	}
+
+	// ---------------------------------------------------------------
+	// StopPollThread -- signal stop, join thread, free baseline.
+	// Called at INNER CLOSE and defensively at FRAMESEQUENCE CLOSE.
+	// ---------------------------------------------------------------
+	void StopPollThread()
+	{
+		if (!_pollRunning.load())
+			return;
+
+		_pollRunning.store(false);
+
+		if (_pollThread.joinable())
+			_pollThread.join();
+
+		if (_debugPoll)
+		{
+			String msg = "[Poll] Thread stopped: iterations="_s;
+			msg += String::IntToString(_pollIterations);
+			msg += " detections="_s;
+			msg += String::IntToString(_pollDetections);
+			msg += " writeOK="_s;
+			msg += String::IntToString(_pollWriteOK);
+			msg += " writeFail="_s;
+			msg += String::IntToString(_pollWriteFail);
+			GePrint(msg);
+		}
+
+		if (_baseline)
+		{
+			DeleteMem(_baseline);
+			_baseline = nullptr;
+		}
 	}
 
 	// ---------------------------------------------------------------
@@ -255,6 +565,11 @@ private:
 		msg += String::IntToString(totalCells);
 		msg += " final tiles + sentinel for frame "_s;
 		msg += String::IntToString((Int32)frame);
+		if (_debugPoll)
+		{
+			msg += " fpos="_s;
+			msg += String::IntToString((Int32)ftell(_albtFile));
+		}
 		GePrint(msg);
 	}
 
@@ -334,10 +649,12 @@ public:
 					_streamStartTime = GeGetTimer();
 					_headerWritten = false;
 					_frameIndex = 0;
+					_debugPoll = (getenv("ALBT_DEBUG_POLL") != nullptr);
 				}
 				else
 				{
 					GePrint("[BucketCapture] === FRAMESEQUENCE CLOSE ==="_s);
+					StopPollThread();  // defensive: ensure thread stopped
 					if (_albtFile)
 					{
 						fclose(_albtFile);
@@ -362,6 +679,8 @@ public:
 					}
 					_lineCount = 0;
 					_activeRender = nullptr;
+					_pollRunning.store(false);
+					_baseline = nullptr;
 					_sentinelWritten = false;
 					_bucketSizeX = 64;
 					_bucketSizeY = 64;
@@ -449,6 +768,9 @@ public:
 							msg += "x"_s;
 							msg += String::IntToString(_gridRows);
 							GePrint(msg);
+
+							// Start VPBuffer poll thread (for GPU renderers)
+							StartPollThread();
 						}
 					}
 				}
@@ -463,6 +785,9 @@ public:
 			{
 				if (!vps->open)
 				{
+					// Stop poll thread before final flush
+					StopPollThread();
+
 					FlushAllCells(
 						vps->render ? vps->render : _activeRender,
 						(UInt32)_frameIndex);
