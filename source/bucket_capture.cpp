@@ -347,7 +347,15 @@ public:
 			{
 				if (vps->open)
 				{
-					_frameIndex++;
+					if (vps->doc)
+					{
+						const Int32 fps = vps->doc->GetFps();
+						_frameIndex = (Int32)vps->doc->GetTime().GetFrame(fps);
+					}
+					else
+					{
+						_frameIndex++;
+					}
 					_lineCount = 0;
 					_activeRender = nullptr;
 					_sentinelWritten = false;
