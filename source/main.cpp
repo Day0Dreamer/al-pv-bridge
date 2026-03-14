@@ -11,6 +11,7 @@
 #include "c4d_resource.h"
 #include "pv_bridge.h"
 #include "bucket_capture.h"
+#include "auto_inject.h"
 
 // Forward declarations from pv_bridge.cpp
 cinema::Bool RegisterPVBridgeCommand();
@@ -30,6 +31,9 @@ cinema::Bool cinema::PluginStart()
 	if (!RegisterBucketCapture())
 		return false;
 
+	if (!RegisterAutoInjectSceneHook())
+		return false;
+
 	return true;
 }
 
@@ -47,6 +51,11 @@ cinema::Bool cinema::PluginMessage(cinema::Int32 id, void* data)
 			if (!cinema::g_resource.Init())
 				return false;
 			return true;
+		}
+		case C4DPL_PROGRAM_STARTED:
+		{
+			AutoInjectOnStartup();
+			break;
 		}
 	}
 
