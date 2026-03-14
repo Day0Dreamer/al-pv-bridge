@@ -8,17 +8,16 @@
 	  - pp->cpu_num identifies which render thread owns the bucket
 	  - Bucket boundaries detected by tracking per-CPU (x-range, line sequence)
 
-	Strategy (v2 → v4):
-	  1. Track per-CPU bucket state in ExecuteLine()
-	  2. When boundary detected → save completed tile IMMEDIATELY from render thread
-	  3. At INNER close, flush only the last active bucket per CPU
+	Strategy (v5 — grid-based):
+	  1. At RENDER OPEN, compute the bucket grid from frame dimensions + bucket size
+	  2. In ExecuteLine(), map each scanline to its grid cell and count lines received
+	  3. When a cell reaches its expected line count → save tile immediately
+	  4. At INNER close, save any unsaved cells as a safety net
 
-	V4 fixes:
-	  - Progressive saving: tiles appear on disk as each bucket completes (not deferred)
-	  - Bug 1 (false merges):  Cap bucket height at render-settings bucket size
-	  - Bug 2 (multi-pass re-save): Structurally eliminated (no accumulation buffer)
-	  - Bug 3 (false splits): Allow 1-scanline gap tolerance in line sequence
-	  - Thread safety: per-CPU tile counters + CPU ID in filenames (no shared mutation)
+	Previous heuristic approach (v2-v4) tried to detect bucket boundaries from
+	per-CPU line sequences. This produced off-grid tiles when gap tolerance and
+	height caps interacted with thread scheduling. The grid approach is exact:
+	each scanline self-identifies its cell via cellX = xmin/bucketW, cellY = line/bucketH.
 
 	Output goes to C:\temp\bucket_capture_cpp\ as individual bucket PNGs.
 */
@@ -29,29 +28,12 @@
 using namespace cinema;
 
 // ---------------------------------------------------------------------------
-// Per-CPU bucket tracker — each render thread gets its own slot
+// Grid cell — tracks how many scanlines have been received for one bucket
 // ---------------------------------------------------------------------------
-struct CPUBucketState
+struct GridCell
 {
-	// Currently accumulating bucket
-	Int32 firstLine;
-	Int32 lastLine;
-	Int32 xMin;
-	Int32 xMax;
-	Bool  active;
-
-	// Per-CPU tile counter (thread-safe: each CPU only writes its own slot)
-	Int32 savedCount;
-
-	void Reset()
-	{
-		active = false;
-		firstLine = -1;
-		lastLine = -1;
-		xMin = 0;
-		xMax = 0;
-		savedCount = 0;
-	}
+	Int32 linesReceived;
+	Bool  saved;
 };
 
 // ---------------------------------------------------------------------------
@@ -69,22 +51,22 @@ private:
 	// Per-frame counters
 	Int32 _lineCount;
 
-	// Per-CPU bucket tracking
-	static const Int32 MAX_CPUS = 128;
-	CPUBucketState _cpuState[MAX_CPUS];
-
 	// Stored render pointer (set at RENDER OPEN, used at INNER CLOSE)
 	Render* _activeRender;
 
 	// Frame dimensions (from RayParameter)
-	Int32 _frameLeft;
-	Int32 _frameTop;
-	Int32 _frameRight;
-	Int32 _frameBottom;
+	Int32 _frameW;
+	Int32 _frameH;
 
-	// Bucket size from render settings (Bug 1 fix: cap height to prevent false merges)
+	// Bucket size from render settings
 	Int32 _bucketSizeX;
 	Int32 _bucketSizeY;
+
+	// Bucket grid — each cell tracks scanline count for one bucket position
+	static const Int32 MAX_GRID_CELLS = 16384;  // up to ~128x128 grid
+	GridCell _grid[MAX_GRID_CELLS];
+	Int32    _gridCols;
+	Int32    _gridRows;
 
 	// Save just the bucket tile region from VPBuffer
 	Bool SaveBucketTile(Render* render, const Filename& path,
@@ -191,9 +173,8 @@ private:
 		return ok;
 	}
 
-	// Build a tile filename: "f01_c03_tile_0005_x64_y128_64x64.png"
-	// CPU number in filename guarantees uniqueness across render threads
-	Filename MakeTileFilename(Int32 frame, Int32 cpu, Int32 index, Int32 x, Int32 y, Int32 w, Int32 h)
+	// Build a tile filename: "f01_x064_y128_64x64.png"
+	Filename MakeTileFilename(Int32 frame, Int32 x, Int32 y, Int32 w, Int32 h)
 	{
 		String frameStr = String::IntToString(frame);
 		while (frameStr.GetLength() < 2)
@@ -203,28 +184,8 @@ private:
 			frameStr = padded;
 		}
 
-		String cpuStr = String::IntToString(cpu);
-		while (cpuStr.GetLength() < 2)
-		{
-			String padded = "0"_s;
-			padded += cpuStr;
-			cpuStr = padded;
-		}
-
-		String numStr = String::IntToString(index);
-		while (numStr.GetLength() < 4)
-		{
-			String padded = "0"_s;
-			padded += numStr;
-			numStr = padded;
-		}
-
 		String name = "f"_s;
 		name += frameStr;
-		name += "_c"_s;
-		name += cpuStr;
-		name += "_tile_"_s;
-		name += numStr;
 		name += "_x"_s;
 		name += String::IntToString(x);
 		name += "_y"_s;
@@ -254,46 +215,64 @@ private:
 		return _outputDir + Filename(name);
 	}
 
-	// Save a single completed bucket tile immediately
-	void SaveCompletedBucket(Render* render, Int32 frame, Int32 cpu, CPUBucketState& bs)
+	// Compute the pixel rect for a grid cell, handling right/bottom edge
+	void GetCellRect(Int32 cellX, Int32 cellY,
+		Int32& outX, Int32& outY, Int32& outW, Int32& outH)
 	{
-		if (!render)
-			return;
+		outX = cellX * _bucketSizeX;
+		outY = cellY * _bucketSizeY;
+		outW = _bucketSizeX;
+		outH = _bucketSizeY;
 
-		bs.savedCount++;
-		Int32 tileW = bs.xMax - bs.xMin + 1;
-		Int32 tileH = bs.lastLine - bs.firstLine + 1;
-		Filename fn = MakeTileFilename(frame, cpu, bs.savedCount, bs.xMin, bs.firstLine, tileW, tileH);
-		SaveBucketTile(render, fn, bs.xMin, bs.firstLine, bs.xMax, bs.lastLine);
+		// Clamp to frame bounds for edge cells
+		if (outX + outW > _frameW)
+			outW = _frameW - outX;
+		if (outY + outH > _frameH)
+			outH = _frameH - outY;
 	}
 
-	// Flush remaining active buckets at INNER close
-	// Most tiles are already saved progressively from ExecuteLine;
-	// this only catches the last in-progress bucket on each CPU.
-	void FlushRemainingBuckets(Render* render, Int32 frame)
+	// Save a grid cell's tile from VPBuffer
+	void SaveGridCell(Render* render, Int32 frame, Int32 cellX, Int32 cellY)
 	{
 		if (!render)
 			return;
 
-		Int32 flushed = 0;
-		Int32 totalSaved = 0;
-		for (Int32 cpu = 0; cpu < MAX_CPUS; cpu++)
+		Int32 x, y, w, h;
+		GetCellRect(cellX, cellY, x, y, w, h);
+
+		if (w <= 0 || h <= 0)
+			return;
+
+		Filename fn = MakeTileFilename(frame, x, y, w, h);
+		SaveBucketTile(render, fn, x, y, x + w - 1, y + h - 1);
+	}
+
+	// Re-save ALL grid cells with final VPBuffer data (guaranteed correct at INNER close).
+	// Progressive saves from ExecuteLine may have stale pixel data — this overwrites them.
+	void FlushAllCells(Render* render, Int32 frame)
+	{
+		if (!render)
+			return;
+
+		Int32 totalCells = _gridCols * _gridRows;
+		Int32 progressiveCount = 0;
+
+		for (Int32 i = 0; i < totalCells; i++)
 		{
-			CPUBucketState& bs = _cpuState[cpu];
-			if (bs.active)
-			{
-				SaveCompletedBucket(render, frame, cpu, bs);
-				bs.active = false;
-				flushed++;
-			}
-			totalSaved += bs.savedCount;
+			if (_grid[i].saved)
+				progressiveCount++;
+
+			Int32 cellX = i % _gridCols;
+			Int32 cellY = i / _gridCols;
+			SaveGridCell(render, frame, cellX, cellY);
+			_grid[i].saved = true;
 		}
 
-		String msg = "[BucketCapture] INNER CLOSE — flushed "_s;
-		msg += String::IntToString(flushed);
-		msg += " remaining, "_s;
-		msg += String::IntToString(totalSaved);
-		msg += " total tiles this pass"_s;
+		String msg = "[BucketCapture] INNER CLOSE -- re-saved all "_s;
+		msg += String::IntToString(totalCells);
+		msg += " tiles ("_s;
+		msg += String::IntToString(progressiveCount);
+		msg += " were progressive previews)"_s;
 		GePrint(msg);
 	}
 
@@ -329,6 +308,8 @@ public:
 
 					_outputDir = Filename("C:\\temp\\bucket_capture_cpp"_s);
 					GeFCreateDir(_outputDir);
+
+					_frameIndex = 0;
 				}
 				else
 				{
@@ -341,22 +322,15 @@ public:
 			{
 				if (vps->open)
 				{
-					// Read actual frame number from the document timeline
-					_frameIndex = 0;
-					BaseDocument* frameDoc = node->GetDocument();
-					if (frameDoc)
-					{
-						_frameIndex = frameDoc->GetTime().GetFrame(frameDoc->GetFps());
-					}
-
+					_frameIndex++;
 					_lineCount = 0;
 					_activeRender = nullptr;
 					_bucketSizeX = 64;
 					_bucketSizeY = 64;
-
-					// Reset all per-CPU state
-					for (Int32 i = 0; i < MAX_CPUS; i++)
-						_cpuState[i].Reset();
+					_frameW = 0;
+					_frameH = 0;
+					_gridCols = 0;
+					_gridRows = 0;
 
 					String msg = "[BucketCapture] --- FRAME OPEN (frame "_s;
 					msg += String::IntToString(_frameIndex);
@@ -375,14 +349,8 @@ public:
 						}
 					}
 
-					Int32 totalTiles = 0;
-					for (Int32 i = 0; i < MAX_CPUS; i++)
-						totalTiles += _cpuState[i].savedCount;
-
 					String msg = "[BucketCapture] --- FRAME CLOSE --- lines="_s;
 					msg += String::IntToString(_lineCount);
-					msg += " savedTiles="_s;
-					msg += String::IntToString(totalTiles);
 					GePrint(msg);
 				}
 				break;
@@ -394,7 +362,7 @@ public:
 				{
 					_activeRender = vps->render;
 
-					// Bug 1 fix: read bucket size from render settings
+					// Read bucket size from render settings
 					_bucketSizeX = 64;
 					_bucketSizeY = 64;
 					BaseDocument* doc = node->GetDocument();
@@ -421,19 +389,39 @@ public:
 						const RayParameter* ray = vps->vd->GetRayParameter();
 						if (ray)
 						{
-							_frameLeft   = ray->left;
-							_frameTop    = ray->top;
-							_frameRight  = ray->right;
-							_frameBottom = ray->bottom;
+							_frameW = ray->right - ray->left + 1;
+							_frameH = ray->bottom - ray->top + 1;
 
-							String msg = "[BucketCapture] RENDER OPEN — "_s;
-							msg += String::IntToString(_frameRight - _frameLeft + 1);
+							// Compute grid dimensions
+							_gridCols = (_frameW + _bucketSizeX - 1) / _bucketSizeX;
+							_gridRows = (_frameH + _bucketSizeY - 1) / _bucketSizeY;
+
+							Int32 totalCells = _gridCols * _gridRows;
+							if (totalCells > MAX_GRID_CELLS)
+								totalCells = MAX_GRID_CELLS;
+
+							// Reset grid
+							for (Int32 i = 0; i < totalCells; i++)
+							{
+								_grid[i].linesReceived = 0;
+								_grid[i].saved = false;
+							}
+
+							String msg = "[BucketCapture] RENDER OPEN "_s;
+							msg += String::IntToString(_frameW);
 							msg += "x"_s;
-							msg += String::IntToString(_frameBottom - _frameTop + 1);
-							msg += " bucketSize="_s;
+							msg += String::IntToString(_frameH);
+							msg += " bucket="_s;
 							msg += String::IntToString(_bucketSizeX);
 							msg += "x"_s;
 							msg += String::IntToString(_bucketSizeY);
+							msg += " grid="_s;
+							msg += String::IntToString(_gridCols);
+							msg += "x"_s;
+							msg += String::IntToString(_gridRows);
+							msg += " ("_s;
+							msg += String::IntToString(_gridCols * _gridRows);
+							msg += " cells)"_s;
 							GePrint(msg);
 						}
 					}
@@ -449,9 +437,8 @@ public:
 			{
 				if (!vps->open)
 				{
-					// INNER close — flush last active bucket on each CPU
-					// (all earlier buckets were already saved progressively)
-					FlushRemainingBuckets(vps->render ? vps->render : _activeRender, _frameIndex);
+					// Re-save ALL cells with final pixel data (overwrites progressive previews)
+					FlushAllCells(vps->render ? vps->render : _activeRender, _frameIndex);
 				}
 				break;
 			}
@@ -465,58 +452,62 @@ public:
 
 	// -----------------------------------------------------------------
 	// ExecuteLine — per-scanline pixel interception
-	// Detects bucket boundaries and saves tiles IMMEDIATELY from the
-	// render thread. Each CPU writes its own state — no shared mutation.
-	// VPBuffer is readable during ExecuteLine (SDK contract).
+	// Maps each scanline to its grid cell and increments the line counter.
+	// When a cell has received all its expected lines → save immediately.
 	// -----------------------------------------------------------------
 	virtual void ExecuteLine(BaseVideoPost* node, PixelPost* pp) override
 	{
-		if (!pp)
+		if (!pp || _gridCols <= 0 || _gridRows <= 0)
 			return;
 
 		_lineCount++;
 
-		Int32 cpu = pp->cpu_num;
-		if (cpu < 0 || cpu >= MAX_CPUS)
+		// Map scanline to grid cell
+		Int32 cellX = pp->xmin / _bucketSizeX;
+		Int32 cellY = pp->line / _bucketSizeY;
+
+		if (cellX < 0 || cellX >= _gridCols || cellY < 0 || cellY >= _gridRows)
 			return;
 
-		CPUBucketState& bs = _cpuState[cpu];
+		Int32 cellIdx = cellY * _gridCols + cellX;
+		if (cellIdx >= MAX_GRID_CELLS)
+			return;
 
-		// Detect bucket boundary: x-range changed, line gap > 1, or height cap reached
-		Bool newBucket = !bs.active
-			|| pp->xmin != bs.xMin
-			|| pp->xmax != bs.xMax
-			|| pp->line > bs.lastLine + 2                         // Bug 3: 1-line gap tolerance
-			|| (bs.lastLine - bs.firstLine + 1) >= _bucketSizeY;  // Bug 1: height cap
+		GridCell& cell = _grid[cellIdx];
+		cell.linesReceived++;
 
-		if (newBucket)
+		// Check if this cell is now complete
+		if (!cell.saved)
 		{
-			// Save previous bucket immediately — tile appears on disk now
-			if (bs.active && _activeRender)
+			// Expected height for this cell (edge cells may be shorter)
+			Int32 expectedH = _bucketSizeY;
+			Int32 cellBottom = (cellY + 1) * _bucketSizeY;
+			if (cellBottom > _frameH)
+				expectedH = _frameH - cellY * _bucketSizeY;
+
+			if (cell.linesReceived >= expectedH && _activeRender)
 			{
-				SaveCompletedBucket(_activeRender, _frameIndex, cpu, bs);
+				cell.saved = true;
+				SaveGridCell(_activeRender, _frameIndex, cellX, cellY);
 			}
-
-			// Start tracking new bucket
-			bs.active = true;
-			bs.firstLine = pp->line;
-			bs.xMin = pp->xmin;
-			bs.xMax = pp->xmax;
 		}
-
-		bs.lastLine = pp->line;
 
 		// Log first 5 lines for debugging
 		if (_lineCount <= 5)
 		{
 			String msg = "[BucketCapture] ExecuteLine: cpu="_s;
-			msg += String::IntToString(cpu);
+			msg += String::IntToString(pp->cpu_num);
 			msg += " line="_s;
 			msg += String::IntToString(pp->line);
 			msg += " x="_s;
 			msg += String::IntToString(pp->xmin);
 			msg += ".."_s;
 			msg += String::IntToString(pp->xmax);
+			msg += " -> cell("_s;
+			msg += String::IntToString(cellX);
+			msg += ","_s;
+			msg += String::IntToString(cellY);
+			msg += ")"_s;
 			GePrint(msg);
 		}
 	}
