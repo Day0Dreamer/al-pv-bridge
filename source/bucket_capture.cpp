@@ -9,7 +9,7 @@
 	  4. At INNER close, re-save ALL cells as final records + frame sentinel
 	  5. At FRAMESEQUENCE CLOSE, close .albt file
 
-	Output: C:\temp\albt_streams\{uuid}.albt
+	Output: $ALBT_STREAM_DIR\{uuid}.albt  (default: C:\temp\albt_streams)
 	Format: docs/adr/009-binary-tile-stream-for-render-farm.md
 */
 
@@ -17,6 +17,7 @@
 #include "c4d_videopostdata.h"
 
 #include <cstdio>     // FILE*, fwrite, fopen, fclose, fflush
+#include <cstdlib>    // getenv
 #include <mutex>      // std::mutex, std::lock_guard
 
 using namespace cinema;
@@ -303,12 +304,15 @@ public:
 						GePrint("[BucketCapture] WARNING: No scene UUID found"_s);
 					}
 
-					// Create output directory
-					Filename streamDir("C:\\temp\\albt_streams"_s);
+					// Create output directory (ALBT_STREAM_DIR env var or default)
+					const char* envDir = getenv("ALBT_STREAM_DIR");
+					String dirStr = envDir ? String(envDir) : "C:\\temp\\albt_streams"_s;
+					Filename streamDir(dirStr);
 					GeFCreateDir(streamDir);
 
-					// Build path: C:\temp\albt_streams\{uuid}.albt
-					String pathStr = "C:\\temp\\albt_streams\\"_s;
+					// Build path: {dir}\{uuid}.albt
+					String pathStr = dirStr;
+					pathStr += "\\"_s;
 					pathStr += _jobUUID;
 					pathStr += ".albt"_s;
 
