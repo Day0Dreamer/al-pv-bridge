@@ -46,6 +46,7 @@ enum class TransportMode
 	TCP_SINK,   // send records over TCP to sink process
 	LOCAL_FILE  // write directly to local .albt file (v7 fallback)
 };
+MAXON_ENUM_LIST(TransportMode);
 
 // ---------------------------------------------------------------------------
 // Winsock lifecycle -- called from main.cpp
