@@ -1,22 +1,24 @@
 /*
-	Bucket Capture -- VideoPostData implementation
+	Bucket Capture -- VideoPostData implementation (v8 -- TCP sink transport)
 	(C) Amber Light, 2026
 
-	Strategy (v7 -- .albt binary stream + VPBuffer polling):
-	  1. At FRAMESEQUENCE OPEN, read scene UUID and open .albt file
-	  2. At RENDER OPEN, compute bucket grid, write stream header, start poll thread
-	  3. In ExecuteLine(), map scanline to grid cell; when complete, write progressive record
-	     (Standard/Physical only -- GPU renderers skip ExecuteLine entirely)
+	Strategy:
+	  1. At FRAMESEQUENCE OPEN, read scene UUID and resolve sink address
+	  2. At RENDER OPEN, connect TCP socket (or open file), send handshake,
+	     compute bucket grid, start poll thread
+	  3. In ExecuteLine(), map scanline to grid cell; when complete, send
+	     progressive tile record (Standard/Physical only)
 	  4. Poll thread samples VPBuffer center-pixel per cell every 250ms,
-	     writes progressive tiles for changed cells (GPU renderers)
-	  5. At INNER close, stop poll thread, re-save ALL cells as final + sentinel
-	  6. At FRAMESEQUENCE CLOSE, close .albt file
+	     sends progressive tiles for changed cells (GPU renderers)
+	  5. At INNER close, stop poll thread, send ALL cells as final + sentinel
+	  6. At FRAMESEQUENCE CLOSE, close socket (or file)
 
-	The poll thread is harmless for Standard/Physical: ExecuteLine marks cells
-	saved first, so the poll thread finds them saved and writes nothing.
+	Transport:
+	  - If ALBT_SINK_URL is set (e.g. "192.168.1.100:9200"), all tile records
+	    are sent over TCP to a sink process. The sink writes the .albt file.
+	  - If ALBT_SINK_URL is not set, falls back to local file I/O (v7 behaviour).
 
-	Output: $ALBT_STREAM_DIR\{uuid}.albt  (default: C:\temp\albt_streams)
-	Format: docs/adr/009-binary-tile-stream-for-render-farm.md
+	Output format: .albt v1 binary stream
 */
 
 #include "bucket_capture.h"
@@ -24,6 +26,7 @@
 
 #include <cstdio>     // FILE*, fwrite, fopen, fclose, fflush
 #include <cstdlib>    // getenv
+#include <cstring>    // memcpy
 #include <mutex>      // std::mutex, std::lock_guard
 #include <thread>     // std::thread
 #include <atomic>     // std::atomic<bool>
@@ -36,6 +39,46 @@ static const UChar PHASE_PROGRESSIVE = 0x00;
 static const UChar PHASE_FINAL       = 0x01;
 static const UChar PHASE_SENTINEL    = 0xFF;
 
+// Transport mode
+enum class TransportMode
+{
+	NONE,       // not initialised
+	TCP_SINK,   // send records over TCP to sink process
+	LOCAL_FILE  // write directly to local .albt file (v7 fallback)
+};
+
+// ---------------------------------------------------------------------------
+// Winsock lifecycle -- called from main.cpp
+// ---------------------------------------------------------------------------
+static Bool g_winsockReady = false;
+
+Bool InitWinsock()
+{
+#ifdef _WIN32
+	WSADATA wsaData;
+	int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (result != 0)
+	{
+		GePrint("[BucketCapture] WSAStartup failed"_s);
+		return false;
+	}
+	g_winsockReady = true;
+	GePrint("[BucketCapture] Winsock initialized"_s);
+#endif
+	return true;
+}
+
+void CleanupWinsock()
+{
+#ifdef _WIN32
+	if (g_winsockReady)
+	{
+		WSACleanup();
+		g_winsockReady = false;
+	}
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Grid cell -- tracks how many scanlines have been received for one bucket
 // ---------------------------------------------------------------------------
@@ -46,7 +89,7 @@ struct GridCell
 };
 
 // ---------------------------------------------------------------------------
-// BucketCapturePost -- VideoPostData that writes .albt binary stream
+// BucketCapturePost -- VideoPostData that streams .albt binary records
 // ---------------------------------------------------------------------------
 class BucketCapturePost : public VideoPostData
 {
@@ -76,13 +119,24 @@ private:
 	Int32    _gridCols;
 	Int32    _gridRows;
 
-	// === .albt stream state ===
+	// === Transport state ===
+	TransportMode _transport;
+
+	// TCP sink mode
+	SOCKET      _sinkSocket;        // TCP connection to sink
+	Bool        _sinkConnected;     // connection state
+	Char        _sinkHost[256];     // parsed from ALBT_SINK_URL
+	Char        _sinkPort[16];      // parsed from ALBT_SINK_URL
+
+	// Local file mode (v7 fallback)
 	FILE*       _albtFile;          // opened at FRAMESEQUENCE open, closed at close
-	Int64       _streamStartTime;   // GeGetTimer() ms at file open
 	Bool        _headerWritten;     // deferred to RENDER open (needs frame dims)
+
+	// Shared state
+	Int64       _streamStartTime;   // GeGetTimer() ms at stream start
 	String      _jobUUID;           // from doc BaseContainer[AMBERLIGHT_SCENE_UUID]
 	Bool        _sentinelWritten;   // prevents duplicate sentinels on multi-pass
-	std::mutex  _writeMutex;        // protects all fwrite() calls
+	std::mutex  _writeMutex;        // protects all send()/fwrite() calls
 
 	// === VPBuffer polling thread (for GPU renderers) ===
 	std::thread        _pollThread;
@@ -93,6 +147,182 @@ private:
 	Int32              _pollDetections;   // cells detected as changed
 	Int32              _pollWriteOK;     // successful WriteTileRecord calls from poll
 	Int32              _pollWriteFail;   // failed WriteTileRecord calls from poll
+
+	// ---------------------------------------------------------------
+	// SendAll -- send exactly `len` bytes over TCP (handles partial sends)
+	// ---------------------------------------------------------------
+	Bool SendAll(const void* data, Int32 len)
+	{
+		if (!_sinkConnected || _sinkSocket == INVALID_SOCKET)
+			return false;
+
+		const char* ptr = (const char*)data;
+		Int32 remaining = len;
+		while (remaining > 0)
+		{
+			int sent = send(_sinkSocket, ptr, remaining, 0);
+			if (sent == SOCKET_ERROR || sent <= 0)
+			{
+				GePrint("[BucketCapture] TCP send() failed"_s);
+				_sinkConnected = false;
+				return false;
+			}
+			ptr += sent;
+			remaining -= sent;
+		}
+		return true;
+	}
+
+	// ---------------------------------------------------------------
+	// ConnectToSink -- establish TCP connection to the sink process
+	// ---------------------------------------------------------------
+	Bool ConnectToSink()
+	{
+		if (!g_winsockReady)
+			return false;
+
+		struct addrinfo hints;
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
+
+		struct addrinfo* result = nullptr;
+		int rc = getaddrinfo(_sinkHost, _sinkPort, &hints, &result);
+		if (rc != 0 || !result)
+		{
+			String msg = "[BucketCapture] getaddrinfo failed for "_s;
+			msg += String(_sinkHost);
+			msg += ":"_s;
+			msg += String(_sinkPort);
+			GePrint(msg);
+			return false;
+		}
+
+		_sinkSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+		if (_sinkSocket == INVALID_SOCKET)
+		{
+			freeaddrinfo(result);
+			GePrint("[BucketCapture] socket() failed"_s);
+			return false;
+		}
+
+		rc = connect(_sinkSocket, result->ai_addr, (int)result->ai_addrlen);
+		freeaddrinfo(result);
+
+		if (rc == SOCKET_ERROR)
+		{
+			closesocket(_sinkSocket);
+			_sinkSocket = INVALID_SOCKET;
+			GePrint("[BucketCapture] connect() failed — sink not reachable"_s);
+			return false;
+		}
+
+		_sinkConnected = true;
+
+		String msg = "[BucketCapture] Connected to sink "_s;
+		msg += String(_sinkHost);
+		msg += ":"_s;
+		msg += String(_sinkPort);
+		GePrint(msg);
+		return true;
+	}
+
+	// ---------------------------------------------------------------
+	// SendHandshake -- send UUID + frame dimensions to the sink
+	//
+	// Wire format:
+	//   uuid_len  (uint32)  — length of UUID string in bytes
+	//   uuid      (N bytes) — UTF-8 encoded UUID
+	//   frame_w   (uint16)  — frame width in pixels
+	//   frame_h   (uint16)  — frame height in pixels
+	//   bucket_sz (uint16)  — bucket size in pixels
+	// ---------------------------------------------------------------
+	Bool SendHandshake()
+	{
+		if (!_sinkConnected)
+			return false;
+
+		// Convert UUID to UTF-8
+		Char uuidBuf[256];
+		_jobUUID.GetCString(uuidBuf, sizeof(uuidBuf), STRINGENCODING::UTF8);
+		UInt32 uuidLen = (UInt32)strlen(uuidBuf);
+
+		UInt16 fw = (UInt16)_frameW;
+		UInt16 fh = (UInt16)_frameH;
+		UInt16 bs = (UInt16)_bucketSizeX;
+
+		// Pack into single buffer: uuid_len(4) + uuid(N) + fw(2) + fh(2) + bs(2)
+		Int32 totalLen = 4 + (Int32)uuidLen + 2 + 2 + 2;
+		UChar handshakeBuf[512];
+		if (totalLen > (Int32)sizeof(handshakeBuf))
+			return false;
+
+		Int32 pos = 0;
+		memcpy(handshakeBuf + pos, &uuidLen, 4); pos += 4;
+		memcpy(handshakeBuf + pos, uuidBuf, uuidLen); pos += uuidLen;
+		memcpy(handshakeBuf + pos, &fw, 2); pos += 2;
+		memcpy(handshakeBuf + pos, &fh, 2); pos += 2;
+		memcpy(handshakeBuf + pos, &bs, 2); pos += 2;
+
+		std::lock_guard<std::mutex> lock(_writeMutex);
+		return SendAll(handshakeBuf, totalLen);
+	}
+
+	// ---------------------------------------------------------------
+	// DisconnectSink -- close TCP socket
+	// ---------------------------------------------------------------
+	void DisconnectSink()
+	{
+		if (_sinkSocket != INVALID_SOCKET)
+		{
+			closesocket(_sinkSocket);
+			_sinkSocket = INVALID_SOCKET;
+		}
+		_sinkConnected = false;
+	}
+
+	// ---------------------------------------------------------------
+	// ParseSinkUrl -- parse "host:port" from ALBT_SINK_URL env var.
+	// Returns true if a valid sink URL was found.
+	// ---------------------------------------------------------------
+	Bool ParseSinkUrl()
+	{
+		const char* envUrl = getenv("ALBT_SINK_URL");
+		if (!envUrl || envUrl[0] == '\0')
+			return false;
+
+		// Find the last colon (separates host from port)
+		const char* colon = strrchr(envUrl, ':');
+		if (!colon || colon == envUrl)
+			return false;
+
+		Int32 hostLen = (Int32)(colon - envUrl);
+		if (hostLen >= (Int32)sizeof(_sinkHost))
+			return false;
+
+		memcpy(_sinkHost, envUrl, hostLen);
+		_sinkHost[hostLen] = '\0';
+
+		const char* portStr = colon + 1;
+		if (strlen(portStr) >= sizeof(_sinkPort))
+			return false;
+
+		strcpy(_sinkPort, portStr);
+		return true;
+	}
+
+	// ---------------------------------------------------------------
+	// IsOutputReady -- checks if the transport is ready for writing
+	// ---------------------------------------------------------------
+	Bool IsOutputReady()
+	{
+		if (_transport == TransportMode::TCP_SINK)
+			return _sinkConnected;
+		if (_transport == TransportMode::LOCAL_FILE)
+			return _albtFile != nullptr;
+		return false;
+	}
 
 	// ---------------------------------------------------------------
 	// GetCellRect -- compute pixel rect for a grid cell
@@ -127,10 +357,10 @@ private:
 				GePrint("[Poll] BAIL: _activeRender is null"_s);
 			return;
 		}
-		if (!_albtFile)
+		if (!IsOutputReady())
 		{
 			if (_debugPoll && _pollIterations <= 3)
-				GePrint("[Poll] BAIL: _albtFile is null"_s);
+				GePrint("[Poll] BAIL: output not ready"_s);
 			return;
 		}
 		if (!_baseline)
@@ -226,32 +456,18 @@ private:
 
 				// Write progressive tile record
 				_grid[i].saved = true;
-
-				if (_debugPoll)
-				{
-					long posBefore = _albtFile ? ftell(_albtFile) : -1;
-					SaveGridCell(_activeRender, (UInt32)_frameIndex,
-						PHASE_PROGRESSIVE, cellX, cellY);
-					long posAfter = _albtFile ? ftell(_albtFile) : -1;
-					if (posAfter > posBefore)
-						_pollWriteOK++;
-					else
-						_pollWriteFail++;
-				}
-				else
-				{
-					SaveGridCell(_activeRender, (UInt32)_frameIndex,
-						PHASE_PROGRESSIVE, cellX, cellY);
-				}
-
+				SaveGridCell(_activeRender, (UInt32)_frameIndex,
+					PHASE_PROGRESSIVE, cellX, cellY);
 				_grid[i].saved = false;  // allow re-detection on next poll
+
 				_pollDetections++;
+				if (_debugPoll)
+					_pollWriteOK++;
 			}
 		}
 
 		if (_debugPoll && (_pollIterations % 4 == 0 || detectedThisRound > 0))
 		{
-			long filePos = _albtFile ? ftell(_albtFile) : -1;
 			String msg = "[Poll] iter="_s;
 			msg += String::IntToString(_pollIterations);
 			msg += " checked="_s;
@@ -260,8 +476,6 @@ private:
 			msg += String::IntToString(skippedSaved);
 			msg += " detected="_s;
 			msg += String::IntToString(detectedThisRound);
-			msg += " fpos="_s;
-			msg += String::IntToString((Int32)filePos);
 			msg += " writeOK="_s;
 			msg += String::IntToString(_pollWriteOK);
 			msg += " writeFail="_s;
@@ -292,14 +506,14 @@ private:
 		if (_pollRunning.load())
 			return;
 
-		if (!_activeRender || !_albtFile || _gridCols <= 0 || _gridRows <= 0)
+		if (!_activeRender || !IsOutputReady() || _gridCols <= 0 || _gridRows <= 0)
 		{
 			if (_debugPoll)
 			{
 				String msg = "[Poll] StartPollThread BAIL: render="_s;
 				msg += _activeRender ? "ok"_s : "NULL"_s;
-				msg += " file="_s;
-				msg += _albtFile ? "ok"_s : "NULL"_s;
+				msg += " output="_s;
+				msg += IsOutputReady() ? "ok"_s : "NOT_READY"_s;
 				msg += " grid="_s;
 				msg += String::IntToString(_gridCols);
 				msg += "x"_s;
@@ -404,11 +618,12 @@ private:
 	}
 
 	// ---------------------------------------------------------------
-	// WriteStreamHeader -- 12 bytes, called once at first RENDER open
+	// WriteStreamHeader -- 12 bytes (local file mode only)
+	// In TCP sink mode, the sink writes the stream header itself.
 	// ---------------------------------------------------------------
 	void WriteStreamHeader()
 	{
-		if (!_albtFile)
+		if (_transport != TransportMode::LOCAL_FILE || !_albtFile)
 			return;
 
 		const char magic[4] = {'A', 'L', 'B', 'T'};
@@ -429,14 +644,13 @@ private:
 	// ---------------------------------------------------------------
 	// WriteTileRecord -- 25-byte header + raw RGB pixels
 	//
-	// Reads VPBuffer (same GetLine approach as old SaveBucketTile),
-	// converts Float32 -> UChar RGB888, writes to .albt under lock.
-	// VPBuffer read happens OUTSIDE lock (expensive part).
+	// Reads VPBuffer, converts Float32 -> UChar RGB888, then either
+	// sends over TCP or writes to local file.
 	// ---------------------------------------------------------------
 	Bool WriteTileRecord(Render* render, UInt32 frame, UChar phase,
 		Int32 tileX, Int32 tileY, Int32 tileW, Int32 tileH)
 	{
-		if (!_albtFile || !render)
+		if (!IsOutputReady() || !render)
 			return false;
 
 		VPBuffer* rgba = render->GetBuffer(VPBUFFER_RGBA, NOTOK);
@@ -490,23 +704,45 @@ private:
 		UInt16 w16 = (UInt16)tileW;
 		UInt16 h16 = (UInt16)tileH;
 
-		// Write header + pixels UNDER LOCK
+		// Build contiguous record buffer: 25-byte header + pixel data
+		Int32 recordSize = 25 + (Int32)rgbSize;
+		UChar* recordBuf = nullptr;
+		iferr (recordBuf = NewMem(UChar, recordSize))
 		{
-			std::lock_guard<std::mutex> lock(_writeMutex);
-			fwrite(&frame, 4, 1, _albtFile);
-			fwrite(&phase, 1, 1, _albtFile);
-			fwrite(&x16, 2, 1, _albtFile);
-			fwrite(&y16, 2, 1, _albtFile);
-			fwrite(&w16, 2, 1, _albtFile);
-			fwrite(&h16, 2, 1, _albtFile);
-			fwrite(&timestampUs, 8, 1, _albtFile);
-			fwrite(&pixLen, 4, 1, _albtFile);
-			fwrite(rgbBuf, 1, rgbSize, _albtFile);
-			fflush(_albtFile);
+			DeleteMem(rgbBuf);
+			return false;
 		}
 
+		Int32 pos = 0;
+		memcpy(recordBuf + pos, &frame, 4);       pos += 4;
+		memcpy(recordBuf + pos, &phase, 1);        pos += 1;
+		memcpy(recordBuf + pos, &x16, 2);          pos += 2;
+		memcpy(recordBuf + pos, &y16, 2);          pos += 2;
+		memcpy(recordBuf + pos, &w16, 2);          pos += 2;
+		memcpy(recordBuf + pos, &h16, 2);          pos += 2;
+		memcpy(recordBuf + pos, &timestampUs, 8);  pos += 8;
+		memcpy(recordBuf + pos, &pixLen, 4);       pos += 4;
+		memcpy(recordBuf + pos, rgbBuf, rgbSize);
 		DeleteMem(rgbBuf);
-		return true;
+
+		// Send/write UNDER LOCK
+		Bool ok = false;
+		{
+			std::lock_guard<std::mutex> lock(_writeMutex);
+			if (_transport == TransportMode::TCP_SINK)
+			{
+				ok = SendAll(recordBuf, recordSize);
+			}
+			else if (_transport == TransportMode::LOCAL_FILE && _albtFile)
+			{
+				size_t written = fwrite(recordBuf, 1, recordSize, _albtFile);
+				fflush(_albtFile);
+				ok = (written == (size_t)recordSize);
+			}
+		}
+
+		DeleteMem(recordBuf);
+		return ok;
 	}
 
 	// ---------------------------------------------------------------
@@ -514,14 +750,23 @@ private:
 	// ---------------------------------------------------------------
 	void WriteFrameSentinel(UInt32 frame)
 	{
-		if (!_albtFile)
+		if (!IsOutputReady())
 			return;
 
+		UChar sentinel[5];
+		memcpy(sentinel, &frame, 4);
+		sentinel[4] = PHASE_SENTINEL;
+
 		std::lock_guard<std::mutex> lock(_writeMutex);
-		fwrite(&frame, 4, 1, _albtFile);
-		UChar sentinel = PHASE_SENTINEL;
-		fwrite(&sentinel, 1, 1, _albtFile);
-		fflush(_albtFile);
+		if (_transport == TransportMode::TCP_SINK)
+		{
+			SendAll(sentinel, 5);
+		}
+		else if (_transport == TransportMode::LOCAL_FILE && _albtFile)
+		{
+			fwrite(sentinel, 1, 5, _albtFile);
+			fflush(_albtFile);
+		}
 	}
 
 	// ---------------------------------------------------------------
@@ -543,7 +788,7 @@ private:
 	// ---------------------------------------------------------------
 	void FlushAllCells(Render* render, UInt32 frame)
 	{
-		if (!render || !_albtFile)
+		if (!render || !IsOutputReady())
 			return;
 
 		if (_sentinelWritten)
@@ -565,11 +810,9 @@ private:
 		msg += String::IntToString(totalCells);
 		msg += " final tiles + sentinel for frame "_s;
 		msg += String::IntToString((Int32)frame);
-		if (_debugPoll)
-		{
-			msg += " fpos="_s;
-			msg += String::IntToString((Int32)ftell(_albtFile));
-		}
+		msg += " ("_s;
+		msg += (_transport == TransportMode::TCP_SINK) ? "TCP"_s : "file"_s;
+		msg += ")"_s;
 		GePrint(msg);
 	}
 
@@ -619,35 +862,55 @@ public:
 						GePrint("[BucketCapture] WARNING: No scene UUID found"_s);
 					}
 
-					// Create output directory (ALBT_STREAM_DIR env var or default)
-					const char* envDir = getenv("ALBT_STREAM_DIR");
-					String dirStr = envDir ? String(envDir) : "C:\\temp\\albt_streams"_s;
-					Filename streamDir(dirStr);
-					GeFCreateDir(streamDir);
+					// Determine transport mode
+					_transport = TransportMode::NONE;
+					_sinkSocket = INVALID_SOCKET;
+					_sinkConnected = false;
+					_albtFile = nullptr;
+					_headerWritten = false;
 
-					// Build path: {dir}\{uuid}.albt
-					String pathStr = dirStr;
-					pathStr += "\\"_s;
-					pathStr += _jobUUID;
-					pathStr += ".albt"_s;
-
-					Char pathBuf[512];
-					pathStr.GetCString(pathBuf, sizeof(pathBuf), STRINGENCODING::UTF8);
-					_albtFile = fopen(pathBuf, "wb");
-
-					if (!_albtFile)
+					if (ParseSinkUrl())
 					{
-						GePrint("[BucketCapture] ERROR: Failed to open .albt file"_s);
+						_transport = TransportMode::TCP_SINK;
+						String msg = "[BucketCapture] Sink configured: "_s;
+						msg += String(_sinkHost);
+						msg += ":"_s;
+						msg += String(_sinkPort);
+						GePrint(msg);
 					}
 					else
 					{
-						String openMsg = "[BucketCapture] Opened "_s;
-						openMsg += pathStr;
-						GePrint(openMsg);
+						// Fallback: local file mode (v7 behaviour)
+						_transport = TransportMode::LOCAL_FILE;
+
+						const char* envDir = getenv("ALBT_STREAM_DIR");
+						String dirStr = envDir ? String(envDir) : "C:\\temp\\albt_streams"_s;
+						Filename streamDir(dirStr);
+						GeFCreateDir(streamDir);
+
+						String pathStr = dirStr;
+						pathStr += "\\"_s;
+						pathStr += _jobUUID;
+						pathStr += ".albt"_s;
+
+						Char pathBuf[512];
+						pathStr.GetCString(pathBuf, sizeof(pathBuf), STRINGENCODING::UTF8);
+						_albtFile = fopen(pathBuf, "wb");
+
+						if (!_albtFile)
+						{
+							GePrint("[BucketCapture] ERROR: Failed to open .albt file"_s);
+							_transport = TransportMode::NONE;
+						}
+						else
+						{
+							String openMsg = "[BucketCapture] Opened "_s;
+							openMsg += pathStr;
+							GePrint(openMsg);
+						}
 					}
 
 					_streamStartTime = GeGetTimer();
-					_headerWritten = false;
 					_frameIndex = 0;
 					_debugPoll = (getenv("ALBT_DEBUG_POLL") != nullptr);
 				}
@@ -655,11 +918,17 @@ public:
 				{
 					GePrint("[BucketCapture] === FRAMESEQUENCE CLOSE ==="_s);
 					StopPollThread();  // defensive: ensure thread stopped
-					if (_albtFile)
+
+					if (_transport == TransportMode::TCP_SINK)
+					{
+						DisconnectSink();
+					}
+					else if (_transport == TransportMode::LOCAL_FILE && _albtFile)
 					{
 						fclose(_albtFile);
 						_albtFile = nullptr;
 					}
+					_transport = TransportMode::NONE;
 				}
 				break;
 			}
@@ -752,11 +1021,30 @@ public:
 								_grid[i].saved = false;
 							}
 
-							// Write stream header on first RENDER open
-							if (!_headerWritten && _albtFile)
+							// Transport-specific setup at RENDER OPEN
+							if (_transport == TransportMode::TCP_SINK)
 							{
-								WriteStreamHeader();
-								_headerWritten = true;
+								// Connect to sink and send handshake
+								if (!_sinkConnected)
+								{
+									if (ConnectToSink())
+									{
+										if (!SendHandshake())
+										{
+											GePrint("[BucketCapture] ERROR: Handshake failed"_s);
+											DisconnectSink();
+										}
+									}
+								}
+							}
+							else if (_transport == TransportMode::LOCAL_FILE)
+							{
+								// Write stream header on first RENDER open
+								if (!_headerWritten && _albtFile)
+								{
+									WriteStreamHeader();
+									_headerWritten = true;
+								}
 							}
 
 							String msg = "[BucketCapture] RENDER OPEN "_s;
@@ -767,6 +1055,8 @@ public:
 							msg += String::IntToString(_gridCols);
 							msg += "x"_s;
 							msg += String::IntToString(_gridRows);
+							msg += " transport="_s;
+							msg += (_transport == TransportMode::TCP_SINK) ? "TCP"_s : "file"_s;
 							GePrint(msg);
 
 							// Start VPBuffer poll thread (for GPU renderers)

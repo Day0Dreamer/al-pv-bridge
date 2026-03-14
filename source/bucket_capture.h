@@ -1,25 +1,20 @@
 /*
-	Bucket Capture -- VideoPostData for intercepting render buckets (v7)
+	Bucket Capture -- VideoPostData for intercepting render buckets (v8)
 	(C) Amber Light, 2026
 
 	VideoPostData plugin that intercepts individual render buckets from
-	Cinema 4D's render pipeline and writes them as an .albt binary stream
-	(ADR-009).  Works with ALL renderers:
+	Cinema 4D's render pipeline and streams them as .albt binary records.
 
 	  - Standard/Physical: ExecuteLine() per-scanline callbacks (multi-threaded)
 	  - GPU renderers (Redshift, Octane, Arnold): VPBuffer polling thread
 	    samples center-pixel per cell every 250ms to detect rendered regions
 
-	Key findings:
-	  - VIDEOPOSTCALL::TILE never fires (dead enum for Standard/Physical)
-	  - ExecuteLine() IS the real bucket hook -- but only for CPU renderers
-	  - GPU renderers skip ExecuteLine entirely; VPBuffer poll fills the gap
-	  - Bucket boundaries detected via grid mapping (cellX = xmin/bucketW)
-	  - VPBuffer safely readable at INNER close (single-threaded)
-	  - Three-phase save: progressive from ExecuteLine OR poll, final at INNER
+	Transport (v8):
+	  - Primary: TCP socket to an ALBT sink process (set ALBT_SINK_URL=host:port)
+	  - Fallback: local file write (original v7 behaviour) when no sink configured
 
-	Output: C:\temp\albt_streams\{uuid}.albt
-	Format: docs/adr/009-binary-tile-stream-for-render-farm.md
+	Output format: .albt v1 binary stream
+	See: docs/adr/009-binary-tile-stream-for-render-farm.md
 */
 
 #ifndef BUCKET_CAPTURE_H__
@@ -27,11 +22,21 @@
 
 #include "c4d.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
 // TEMPORARY dev ID -- register at plugincafe.com for production
 static const cinema::Int32 BUCKET_CAPTURE_PLUGIN_ID = 1064201;
 
 // Scene UUID container ID -- matches al_plugin_ids.py AMBERLIGHT_SCENE_UUID
 static const cinema::Int32 AMBERLIGHT_SCENE_UUID = 1065288;
+
+// Winsock lifecycle (called from main.cpp PluginStart/PluginEnd)
+cinema::Bool InitWinsock();
+void CleanupWinsock();
 
 cinema::Bool RegisterBucketCapture();
 

@@ -191,4 +191,20 @@ void AutoInjectOnStartup()
 {
 	BaseDocument* doc = GetActiveDocument();
 	InjectIntoDocument(doc);
+
+	// Log transport mode once at startup
+	const char* sinkUrl = getenv("ALBT_SINK_URL");
+	if (sinkUrl && sinkUrl[0] != '\0')
+	{
+		String msg = "[BucketCapture] Transport: TCP -> "_s;
+		msg += String(sinkUrl);
+		GePrint(msg);
+	}
+	else
+	{
+		const char* envDir = getenv("ALBT_STREAM_DIR");
+		String msg = "[BucketCapture] Transport: FILE -> "_s;
+		msg += envDir ? String(envDir) : "C:\\temp\\albt_streams"_s;
+		GePrint(msg);
+	}
 }

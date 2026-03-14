@@ -22,6 +22,10 @@ cinema::Bool cinema::PluginStart()
 {
 	GePrint("PV Bridge plugin loaded"_s);
 
+	// Initialize Winsock for TCP sink transport (bucket capture)
+	if (!InitWinsock())
+		return false;
+
 	if (!RegisterPVBridgeCommand())
 	{
 		GePrint("PV Bridge: RegisterCommandPlugin FAILED"_s);
@@ -40,6 +44,7 @@ cinema::Bool cinema::PluginStart()
 void cinema::PluginEnd()
 {
 	CleanupAllSessions();
+	CleanupWinsock();
 }
 
 cinema::Bool cinema::PluginMessage(cinema::Int32 id, void* data)
