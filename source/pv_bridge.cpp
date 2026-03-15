@@ -674,9 +674,8 @@ static void HandleQueryStatus(BaseContainer* bc)
 // ---------------------------------------------------------------------------
 // Command dispatcher — shared by CommandData::Execute and MessageData::CoreMessage
 //
-// FIXME: Single shared WorldPluginData — only one command can be
-//   in-flight at a time. Concurrent callers will clobber each
-//   other's data. Need a command queue or per-command IDs.
+// Command serialization is enforced by _command_lock in bridge.py.
+// All Python callers are serialized before reaching WorldPluginData.
 //
 // Reads command from WorldPluginData, dispatches to handler,
 // writes result back to WorldPluginData.
