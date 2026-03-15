@@ -17,7 +17,7 @@
 	  3. PluginMessage(C4DPL_PROGRAM_STARTED) via AutoInjectOnStartup()
 	     → catches the initial document at Cinema 4D launch
 
-	Toggle: ALBT_AUTO_INJECT env var (default: enabled, "0" to disable)
+	Toggle: ALBT_AUTO_INJECT env var (default: disabled, "1" to enable)
 */
 
 #include "auto_inject.h"
@@ -28,14 +28,14 @@ using namespace cinema;
 
 // ---------------------------------------------------------------------------
 // IsAutoInjectEnabled — check ALBT_AUTO_INJECT env var
-// Default: enabled.  Set ALBT_AUTO_INJECT=0 to disable.
+// Default: disabled.  Set ALBT_AUTO_INJECT=1 to enable.
 // ---------------------------------------------------------------------------
 static Bool IsAutoInjectEnabled()
 {
 	const char* env = getenv("ALBT_AUTO_INJECT");
-	if (env && env[0] == '0')
-		return false;
-	return true;
+	if (env && env[0] == '1')
+		return true;
+	return false;
 }
 
 // ---------------------------------------------------------------------------
