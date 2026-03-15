@@ -16,7 +16,8 @@
 	  5. Python reads result from GetWorldPluginData(PV_BRIDGE_PLUGIN_ID)
 
 	C++ owns all BaseBitmaps. Python sends pixel data via
-	CMD_WRITE_PIXELS using BaseContainer memory buffers (SetMemory).
+	CMD_WRITE_PIXELS using in-memory pointer transfer (same-process)
+	or file fallback for backward compatibility.
 */
 
 #include "pv_bridge.h"
@@ -362,19 +363,38 @@ static void HandleBeginFrame(BaseContainer* bc)
 // ---------------------------------------------------------------------------
 // CMD_WRITE_PIXELS (250)
 //
-// FIXME: File-based pixel transfer is a workaround for Python's
-//   BaseContainer having no SetMemory method. Adds disk I/O per
-//   bucket. Consider shared memory or named pipes for high-throughput.
+// Writes a rectangle of pixels into the frame's bitmap.
 //
-// Writes a rectangle of pixels into the frame's bitmap by reading
-// raw RGB bytes from a file. Python writes the file, passes its path
-// in FLD_PIXEL_FILE. C++ reads, writes pixels, then deletes the file.
+// Two transfer paths (selected automatically):
 //
-// File format: raw RGB bytes (3 bytes per pixel), row-major, top-to-bottom.
-// File size must be >= bw * bh * 3.
+//   1. In-memory pointer (FLD_PIXEL_PTR != 0):
+//      Python and C++ share one address space inside Cinema 4D.
+//      Python pins raw RGB bytes in a ctypes buffer and passes the
+//      virtual address as Int64 via BaseContainer. C++ casts it back
+//      to UChar* and reads directly — zero disk I/O, zero copies.
+//
+//      Buffer lifetime is guaranteed by Python:
+//        - Synchronous (CallCommand): buffer is a local variable on
+//          the Python stack; Python is blocked for the entire dispatch.
+//        - Fire-and-forget (SpecialEventAdd + poll): Python pins the
+//          buffer in _pending_pixel_buf and releases it only after
+//          _drain_pending() confirms FLD_RESULT != RESULT_PENDING.
+//
+//      C++ MUST NOT cache or store the pointer. It is valid only for
+//      the duration of this single HandleWritePixels call.
+//
+//   2. File fallback (FLD_PIXEL_PTR == 0):
+//      Legacy path for backward compatibility. Python writes raw RGB
+//      to a temp file (FLD_PIXEL_FILE). C++ reads it, paints pixels,
+//      and deletes the file. Kept so that a newer C++ plugin can work
+//      with an older Python wrapper that hasn't been updated yet.
+//
+// Pixel format: raw RGB bytes (3 bytes per pixel), row-major,
+// top-to-bottom. Expected size: bw * bh * 3.
 //
 // Fields: SESSION_HANDLE, FRAME_NUMBER, BUCKET_X, BUCKET_Y,
-//         BUCKET_W, BUCKET_H, PIXEL_FILE (Filename)
+//         BUCKET_W, BUCKET_H, PIXEL_PTR (Int64), PIXEL_SIZE (Int64),
+//         PIXEL_FILE (Filename, fallback only)
 // ---------------------------------------------------------------------------
 static void HandleWritePixels(BaseContainer* bc)
 {
@@ -408,51 +428,79 @@ static void HandleWritePixels(BaseContainer* bc)
 	Int32 bw = bc->GetInt32(FLD_BUCKET_W);
 	Int32 bh = bc->GetInt32(FLD_BUCKET_H);
 
-	// Read pixel file path
-	Filename pixelFile = bc->GetFilename(FLD_PIXEL_FILE);
-	if (!GeFExist(pixelFile))
-	{
-		GePrint("[PVBridge] WRITE_PIXELS: pixel file not found"_s);
-		bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
-		return;
-	}
-
-	// Read the raw RGB file
 	Int expectedSize = (Int)bw * (Int)bh * 3;
-	AutoAlloc<BaseFile> file;
-	if (!file)
+
+	// --- Pixel source: pointer or file ---
+	// pixelData points to the raw RGB bytes (owned by Python or by us).
+	// ownedBuf is non-null only when we allocated the buffer (file path).
+	const UChar* pixelData = nullptr;
+	UChar* ownedBuf = nullptr;
+
+	Int64 ptr = bc->GetInt64(FLD_PIXEL_PTR);
+	if (ptr != 0)
 	{
-		bc->SetInt32(FLD_RESULT, ERR_ALLOC_FAILED);
-		return;
+		// Path 1: In-memory pointer — same-process, zero-copy.
+		// Python passed the virtual address of a ctypes buffer.
+		// Safe to dereference: Python guarantees the buffer outlives
+		// this dispatch (see docblock above for lifetime contract).
+		Int64 bufSize = bc->GetInt64(FLD_PIXEL_SIZE);
+		if (bufSize < expectedSize)
+		{
+			GePrint("[PVBridge] WRITE_PIXELS: pointer buffer too small"_s);
+			bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
+			return;
+		}
+		pixelData = reinterpret_cast<const UChar*>(ptr);
+	}
+	else
+	{
+		// Path 2: File fallback — legacy path for backward compatibility.
+		Filename pixelFile = bc->GetFilename(FLD_PIXEL_FILE);
+		if (!GeFExist(pixelFile))
+		{
+			GePrint("[PVBridge] WRITE_PIXELS: pixel file not found"_s);
+			bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
+			return;
+		}
+
+		AutoAlloc<BaseFile> file;
+		if (!file)
+		{
+			bc->SetInt32(FLD_RESULT, ERR_ALLOC_FAILED);
+			return;
+		}
+
+		if (!file->Open(pixelFile, FILEOPEN::READ, FILEDIALOG::NONE))
+		{
+			GePrint("[PVBridge] WRITE_PIXELS: failed to open pixel file"_s);
+			bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
+			return;
+		}
+
+		iferr (ownedBuf = NewMemClear(UChar, expectedSize))
+		{
+			bc->SetInt32(FLD_RESULT, ERR_ALLOC_FAILED);
+			return;
+		}
+
+		Int bytesRead = file->ReadBytes(ownedBuf, expectedSize);
+		file->Close();
+
+		if (bytesRead < expectedSize)
+		{
+			GePrint("[PVBridge] WRITE_PIXELS: pixel file too small"_s);
+			DeleteMem(ownedBuf);
+			bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
+			return;
+		}
+
+		pixelData = ownedBuf;
+
+		// Delete the pixel file after reading (cleanup)
+		GeFKill(pixelFile);
 	}
 
-	if (!file->Open(pixelFile, FILEOPEN::READ, FILEDIALOG::NONE))
-	{
-		GePrint("[PVBridge] WRITE_PIXELS: failed to open pixel file"_s);
-		bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
-		return;
-	}
-
-	// Allocate buffer for pixel data
-	UChar* pixelBuf = nullptr;
-	iferr (pixelBuf = NewMemClear(UChar, expectedSize))
-	{
-		bc->SetInt32(FLD_RESULT, ERR_ALLOC_FAILED);
-		return;
-	}
-
-	Int bytesRead = file->ReadBytes(pixelBuf, expectedSize);
-	file->Close();
-
-	if (bytesRead < expectedSize)
-	{
-		GePrint("[PVBridge] WRITE_PIXELS: pixel file too small"_s);
-		DeleteMem(pixelBuf);
-		bc->SetInt32(FLD_RESULT, ERR_PIXEL_DATA);
-		return;
-	}
-
-	// Write pixels row by row using SetPixelCnt (most efficient bulk API)
+	// --- Shared: write pixels row by row using SetPixelCnt ---
 	Int32 rowBytes = bw * 3;
 
 	for (Int32 row = 0; row < bh; row++)
@@ -461,19 +509,22 @@ static void HandleWritePixels(BaseContainer* bc)
 		if (dstY >= sess.height)
 			break;
 
+		// SDK SetPixelCnt takes UChar* (non-const) but only reads the data.
+		// const_cast is safe here — the bitmap copies pixels internally.
 		fs.bitmap->SetPixelCnt(
 			bx, dstY, bw,
-			pixelBuf + row * rowBytes,
+			const_cast<UChar*>(pixelData + row * rowBytes),
 			COLORBYTES_RGB,
 			COLORMODE::RGB,
 			PIXELCNT::NONE
 		);
 	}
 
-	DeleteMem(pixelBuf);
-
-	// Delete the pixel file after reading (cleanup)
-	GeFKill(pixelFile);
+	// Cleanup: only the file path allocates a buffer we own
+	if (ownedBuf)
+	{
+		DeleteMem(ownedBuf);
+	}
 
 	bc->SetInt32(FLD_RESULT, ERR_OK);
 }

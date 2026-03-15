@@ -4,8 +4,8 @@
 
 	Exposes Cinema 4D's C++-only Picture Viewer API to Python via
 	GePluginMessage. C++ owns all bitmaps and handles PV lifecycle.
-	Python sends pixel data via CMD_WRITE_PIXELS using BaseContainer
-	memory buffers.
+	Python sends pixel data via CMD_WRITE_PIXELS using in-memory
+	pointer transfer (same-process) or file fallback.
 
 	Protocol: Python packs a BaseContainer with command + parameters,
 	calls GePluginMessage(PV_BRIDGE_PLUGIN_ID, &bc). C++ processes the
@@ -53,6 +53,29 @@ static const cinema::Int32 FLD_PIXEL_FILE     = 18;  // Filename: path to raw RG
 static const cinema::Int32 FLD_FILL_R         = 19;  // Int32: fill color red (0-255)
 static const cinema::Int32 FLD_FILL_G         = 20;  // Int32: fill color green (0-255)
 static const cinema::Int32 FLD_FILL_B         = 21;  // Int32: fill color blue (0-255)
+
+// ---------------------------------------------------------------------------
+// In-memory pixel transfer fields (same-process pointer passing).
+//
+// Python and C++ share a single address space inside Cinema 4D.
+// Instead of writing pixel data to a temp file, Python pins bytes in a
+// ctypes buffer and passes the virtual address as Int64 through the
+// BaseContainer. C++ casts it back to UChar* and reads directly.
+//
+// Safety contract:
+//   - Synchronous paths: Python is blocked (CallCommand or poll loop),
+//     so the buffer is alive on the Python stack for the entire dispatch.
+//   - Fire-and-forget: Python pins the buffer in a module-level variable
+//     (_pending_pixel_buf) and releases it only after _drain_pending()
+//     confirms C++ has finished (FLD_RESULT != RESULT_PENDING).
+//   - C++ MUST NOT cache or store the pointer beyond HandleWritePixels.
+//     The pointer is only valid for the duration of a single dispatch.
+//
+// Fallback: If FLD_PIXEL_PTR is 0 (absent), HandleWritePixels falls
+// back to FLD_PIXEL_FILE (temp file path) for backward compatibility.
+// ---------------------------------------------------------------------------
+static const cinema::Int32 FLD_PIXEL_PTR      = 22;  // Int64: virtual address of raw RGB pixel buffer
+static const cinema::Int32 FLD_PIXEL_SIZE     = 23;  // Int64: byte count of pixel buffer
 
 // ---------------------------------------------------------------------------
 // Command codes
