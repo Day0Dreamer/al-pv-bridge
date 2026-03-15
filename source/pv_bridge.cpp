@@ -708,14 +708,12 @@ void DispatchPVBridgeCommand()
 			HandleOpenSession(&bc);
 			break;
 		case CMD_BEGIN_FRAME:
-			GePrint("[PVBridge] -> BEGIN_FRAME"_s);
 			HandleBeginFrame(&bc);
 			break;
 		case CMD_WRITE_PIXELS:
 			HandleWritePixels(&bc);
 			break;
 		case CMD_END_FRAME:
-			GePrint("[PVBridge] -> END_FRAME"_s);
 			HandleEndFrame(&bc);
 			break;
 		case CMD_CLOSE_SESSION:
@@ -792,7 +790,6 @@ public:
 		if (wpd->GetInt32(FLD_RESULT) != RESULT_PENDING)
 			return true;  // No pending command, or already processed
 
-		GePrint("[PVBridge] CoreMessage: dispatching from main thread"_s);
 		DispatchPVBridgeCommand();
 
 		return true;
