@@ -817,7 +817,7 @@ Bool RegisterPVBridgeCommand()
 
 	// MessageData for background-thread callers (SpecialEventAdd)
 	if (!RegisterMessagePlugin(
-		PV_BRIDGE_PLUGIN_ID + 2,  // 1064202 — MessageData (avoids collision with BucketCapture 1064201)
+		PV_BRIDGE_MSG_PLUGIN_ID,
 		"PV Bridge Message Handler"_s,
 		0,
 		NewObjClear(PVBridgeMessageData)

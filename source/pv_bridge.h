@@ -25,9 +25,13 @@
 
 // ---------------------------------------------------------------------------
 // Plugin ID — must match al_plugin_ids.py PV_BRIDGE_PLUGIN_ID
-// TEMPORARY dev ID — register at plugincafe.com for production
 // ---------------------------------------------------------------------------
-static const cinema::Int32 PV_BRIDGE_PLUGIN_ID = 1064200;
+static const cinema::Int32 PV_BRIDGE_PLUGIN_ID = 1067794;
+
+// MessageData registration ID — only used for RegisterMessagePlugin uniqueness.
+// NOT referenced from Python; the SpecialEventAdd dispatch checks PV_BRIDGE_PLUGIN_ID.
+// Registered at plugincafe as "amberlight_pv_bridge_messagedata".
+static const cinema::Int32 PV_BRIDGE_MSG_PLUGIN_ID = 1067797;
 
 // ---------------------------------------------------------------------------
 // BaseContainer field IDs — must match wrappers/c4d/picture_viewer/constants.py

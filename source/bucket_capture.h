@@ -28,8 +28,7 @@
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
-// TEMPORARY dev ID -- register at plugincafe.com for production
-static const cinema::Int32 BUCKET_CAPTURE_PLUGIN_ID = 1064201;
+static const cinema::Int32 BUCKET_CAPTURE_PLUGIN_ID = 1067795;
 
 // Scene UUID container ID -- matches al_plugin_ids.py AMBERLIGHT_SCENE_UUID
 static const cinema::Int32 AMBERLIGHT_SCENE_UUID = 1065288;
